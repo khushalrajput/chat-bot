@@ -101,8 +101,104 @@ public class ChatController : ControllerBase
     }
 
     /// <summary>
+    /// SSE streaming endpoint — tokens arrive in real-time.
+    ///
+    /// HOW SSE WORKS FROM SERVER SIDE:
+    /// 1. Set Content-Type to "text/event-stream" — tells client "this is SSE"
+    /// 2. Write "data: {json}\n\n" for each token — SSE format
+    /// 3. Flush after each write — forces bytes through network immediately
+    ///    Without flush, ASP.NET buffers and sends in large batches — no streaming
+    /// 4. Write "data: [DONE]\n\n" — signals end of stream
+    ///
+    /// WHY not return IAsyncEnumerable directly from controller?
+    /// ASP.NET can return IAsyncEnumerable, but it serializes as JSON array.
+    /// SSE is different protocol — must write raw to response stream.
+    ///
+    /// POSTMAN NOTE: Postman supports SSE. Send request, response appears
+    /// token by token in real-time. Much more visible than JSON array.
+    /// </summary>
+    [HttpPost("stream")]
+    public async Task StreamChat(
+        [FromBody] ChatRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Message))
+        {
+            Response.StatusCode = 400;
+            await Response.WriteAsync("{\"error\":\"Message is required\"}", cancellationToken);
+            return;
+        }
+
+        var sessionId = request.SessionId ?? Guid.NewGuid().ToString();
+        var history = _chatHistoryService.GetHistory(sessionId);
+
+        // SSE headers — must be set BEFORE writing body
+        Response.ContentType = "text/event-stream";
+        Response.Headers.CacheControl = "no-cache";
+        Response.Headers.Connection = "keep-alive";
+
+        string prompt;
+        List<string> sources = [];
+
+        if (_vectorStoreService.ChunkCount > 0)
+        {
+            var queryEmbedding = await _embeddingService.GetEmbeddingAsync(
+                request.Message, cancellationToken);
+            var relevantChunks = _vectorStoreService.Search(queryEmbedding, topK: 3);
+            var context = string.Join("\n\n---\n\n", relevantChunks.Select(c => c.Content));
+            sources = relevantChunks.Select(c => c.Id).ToList();
+            prompt = BuildRagPrompt(request.Message, context);
+        }
+        else
+        {
+            prompt = request.Message;
+        }
+
+        // Send sources first so client knows which docs were used
+        await WriteSseEventAsync(Response, new { type = "sources", sessionId, sources }, cancellationToken);
+
+        // Stream tokens as they arrive from Gemini
+        var fullResponse = new System.Text.StringBuilder();
+
+        await foreach (var token in _geminiService.StreamResponseAsync(
+            prompt, history, cancellationToken))
+        {
+            fullResponse.Append(token);
+            await WriteSseEventAsync(Response, new { type = "token", token }, cancellationToken);
+        }
+
+        // Signal stream is complete
+        await WriteSseEventAsync(Response, new { type = "done" }, cancellationToken);
+
+        // Save to conversation history (same as non-streaming)
+        _chatHistoryService.AddMessage(sessionId, new ChatMessage
+        {
+            Role = "user",
+            Content = request.Message
+        });
+        _chatHistoryService.AddMessage(sessionId, new ChatMessage
+        {
+            Role = "model",
+            Content = fullResponse.ToString()
+        });
+    }
+
+    /// <summary>
+    /// Write a single SSE event.
+    /// Format: "data: {json}\n\n"
+    /// The double newline is REQUIRED by SSE spec — it marks event boundary.
+    /// FlushAsync forces bytes to network — without it, buffering kills streaming.
+    /// </summary>
+    private static async Task WriteSseEventAsync(
+        HttpResponse response, object data, CancellationToken cancellationToken)
+    {
+        var json = System.Text.Json.JsonSerializer.Serialize(data);
+        await response.WriteAsync($"data: {json}\n\n", cancellationToken);
+        await response.Body.FlushAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Clear conversation history for a session.
-    /// "Start over" button in a real app.
     /// </summary>
     [HttpDelete("{sessionId}")]
     public IActionResult ClearSession(string sessionId)
