@@ -1,39 +1,42 @@
-using System.Net.Http.Json;
-using ChatBot.Models.Gemini;
-using ChatBot.Settings;
-using Microsoft.Extensions.Options;
+using Microsoft.SemanticKernel.Embeddings;
 
 namespace ChatBot.Services;
 
 /// <summary>
-/// Calls Gemini Embedding API to convert text → vectors.
+/// SK-based embedding service.
 ///
-/// KEY CONCEPT: Embedding models are different from generation models.
-/// - Generation model (gemini-3.1-flash-lite): understands and generates text
-/// - Embedding model (text-embedding-004): converts text to fixed-size number arrays
+/// COMPARE WITH OLD EmbeddingService:
 ///
-/// The embedding model doesn't "understand" your question — it maps meaning to geometry.
-/// Similar meanings → nearby points in 768-dimensional space.
+/// OLD (raw HTTP):
+///   - Build GeminiEmbedRequest with nested DTOs
+///   - POST to batchEmbedContents endpoint
+///   - Deserialize GeminiEmbedResponse
+///   - Extract float[] from embeddings[i].values
+///
+/// NEW (Semantic Kernel):
+///   - Call GenerateEmbeddingsAsync(texts)
+///   - Get back ReadOnlyMemory<float> per text
+///   - Done.
+///
+/// SK knows which embedding model to use (configured in Program.cs).
+/// Swap to OpenAI embeddings = change one line in DI, this code untouched.
 /// </summary>
 public class EmbeddingService : IEmbeddingService
 {
-    private readonly HttpClient _httpClient;
-    private readonly GeminiSettings _settings;
+    private readonly ITextEmbeddingGenerationService _embeddingService;
     private readonly ILogger<EmbeddingService> _logger;
 
-    private const string EmbeddingModel = "gemini-embedding-001";
-
     public EmbeddingService(
-        HttpClient httpClient,
-        IOptions<GeminiSettings> settings,
+        ITextEmbeddingGenerationService embeddingService,
         ILogger<EmbeddingService> logger)
     {
-        _httpClient = httpClient;
-        _settings = settings.Value;
+        _embeddingService = embeddingService;
         _logger = logger;
     }
 
-    public async Task<float[]> GetEmbeddingAsync(string text, CancellationToken cancellationToken = default)
+    public async Task<float[]> GetEmbeddingAsync(
+        string text,
+        CancellationToken cancellationToken = default)
     {
         var results = await GetEmbeddingsAsync([text], cancellationToken);
         return results[0];
@@ -43,48 +46,23 @@ public class EmbeddingService : IEmbeddingService
         List<string> texts,
         CancellationToken cancellationToken = default)
     {
-        // Batch embed endpoint: one call, multiple texts
-        // Much more efficient than calling single-embed N times
-        var request = new GeminiEmbedRequest
-        {
-            Requests = texts.Select(text => new GeminiEmbedSingleRequest
-            {
-                Model = $"models/{EmbeddingModel}",
-                Content = new GeminiContent
-                {
-                    Parts = [new GeminiPart { Text = text }]
-                }
-            }).ToList()
-        };
+        _logger.LogDebug("Generating embeddings for {Count} texts", texts.Count);
 
-        var url = $"{_settings.BaseUrl}/models/{EmbeddingModel}:batchEmbedContents?key={_settings.ApiKey}";
+        // ONE LINE replaces entire batch embedding HTTP logic
+        // SK handles: batching, API calls, response parsing
+        var embeddings = await _embeddingService.GenerateEmbeddingsAsync(
+            texts,
+            cancellationToken: cancellationToken);
 
-        _logger.LogDebug("Embedding {Count} texts via Gemini", texts.Count);
-
-        var response = await _httpClient.PostAsJsonAsync(url, request, cancellationToken);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            var error = await response.Content.ReadAsStringAsync(cancellationToken);
-            _logger.LogError("Embedding API error {Status}: {Error}", response.StatusCode, error);
-            throw new HttpRequestException($"Embedding API returned {response.StatusCode}: {error}");
-        }
-
-        var result = await response.Content.ReadFromJsonAsync<GeminiEmbedResponse>(cancellationToken);
-
-        var embeddings = result?.Embeddings?
-            .Select(e => e.Values ?? [])
+        // SK returns ReadOnlyMemory<float> — convert to float[] for our vector store
+        // ReadOnlyMemory<float> is a zero-copy wrapper — ToArray() copies once
+        var result = embeddings
+            .Select(e => e.ToArray())
             .ToList();
 
-        if (embeddings is null || embeddings.Count != texts.Count)
-        {
-            throw new InvalidOperationException(
-                $"Expected {texts.Count} embeddings, got {embeddings?.Count ?? 0}");
-        }
+        _logger.LogDebug("Generated {Count} embeddings, dimension={Dim}",
+            result.Count, result[0].Length);
 
-        _logger.LogDebug("Got {Count} embeddings, dimension={Dim}",
-            embeddings.Count, embeddings[0].Length);
-
-        return embeddings;
+        return result;
     }
 }

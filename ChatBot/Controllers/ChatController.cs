@@ -8,32 +8,23 @@ namespace ChatBot.Controllers;
 [Route("api/[controller]")]
 public class ChatController : ControllerBase
 {
-    private readonly IGeminiService _geminiService;
+    private readonly IChatService _chatService;
     private readonly IEmbeddingService _embeddingService;
     private readonly IVectorStoreService _vectorStoreService;
     private readonly IChatHistoryService _chatHistoryService;
 
     public ChatController(
-        IGeminiService geminiService,
+        IChatService chatService,
         IEmbeddingService embeddingService,
         IVectorStoreService vectorStoreService,
         IChatHistoryService chatHistoryService)
     {
-        _geminiService = geminiService;
+        _chatService = chatService;
         _embeddingService = embeddingService;
         _vectorStoreService = vectorStoreService;
         _chatHistoryService = chatHistoryService;
     }
 
-    /// <summary>
-    /// RAG-powered chat with conversation history.
-    ///
-    /// SessionId enables multi-turn conversations:
-    /// Turn 1: "How many sick leaves?" → "12 days"
-    /// Turn 2: "Can I carry them forward?" → understands "them" = sick leaves
-    ///
-    /// Without sessionId, every question is independent (stateless).
-    /// </summary>
     [HttpPost]
     public async Task<IActionResult> Chat(
         [FromBody] ChatRequest request,
@@ -42,10 +33,7 @@ public class ChatController : ControllerBase
         if (string.IsNullOrWhiteSpace(request.Message))
             return BadRequest(new { error = "Message is required" });
 
-        // Generate sessionId if not provided — allows stateless testing too
         var sessionId = request.SessionId ?? Guid.NewGuid().ToString();
-
-        // Get existing conversation history for this session
         var history = _chatHistoryService.GetHistory(sessionId);
 
         string response;
@@ -53,7 +41,6 @@ public class ChatController : ControllerBase
 
         if (_vectorStoreService.ChunkCount > 0)
         {
-            // RAG path: embed → search → augment → generate
             var queryEmbedding = await _embeddingService.GetEmbeddingAsync(
                 request.Message, cancellationToken);
 
@@ -64,22 +51,19 @@ public class ChatController : ControllerBase
 
             sources = relevantChunks.Select(c => c.Id).ToList();
 
-            // Pass history so LLM understands conversation context
-            response = await _geminiService.GenerateResponseAsync(
+            response = await _chatService.GetResponseAsync(
                 BuildRagPrompt(request.Message, context),
                 history,
                 cancellationToken);
         }
         else
         {
-            response = await _geminiService.GenerateResponseAsync(
+            response = await _chatService.GetResponseAsync(
                 request.Message,
                 history,
                 cancellationToken);
         }
 
-        // Store both user message and assistant response in history
-        // Next request with same sessionId will include these
         _chatHistoryService.AddMessage(sessionId, new ChatMessage
         {
             Role = "user",
@@ -87,7 +71,7 @@ public class ChatController : ControllerBase
         });
         _chatHistoryService.AddMessage(sessionId, new ChatMessage
         {
-            Role = "model",  // Gemini uses "model", not "assistant"
+            Role = "model",
             Content = response
         });
 
@@ -100,23 +84,6 @@ public class ChatController : ControllerBase
         });
     }
 
-    /// <summary>
-    /// SSE streaming endpoint — tokens arrive in real-time.
-    ///
-    /// HOW SSE WORKS FROM SERVER SIDE:
-    /// 1. Set Content-Type to "text/event-stream" — tells client "this is SSE"
-    /// 2. Write "data: {json}\n\n" for each token — SSE format
-    /// 3. Flush after each write — forces bytes through network immediately
-    ///    Without flush, ASP.NET buffers and sends in large batches — no streaming
-    /// 4. Write "data: [DONE]\n\n" — signals end of stream
-    ///
-    /// WHY not return IAsyncEnumerable directly from controller?
-    /// ASP.NET can return IAsyncEnumerable, but it serializes as JSON array.
-    /// SSE is different protocol — must write raw to response stream.
-    ///
-    /// POSTMAN NOTE: Postman supports SSE. Send request, response appears
-    /// token by token in real-time. Much more visible than JSON array.
-    /// </summary>
     [HttpPost("stream")]
     public async Task StreamChat(
         [FromBody] ChatRequest request,
@@ -132,7 +99,6 @@ public class ChatController : ControllerBase
         var sessionId = request.SessionId ?? Guid.NewGuid().ToString();
         var history = _chatHistoryService.GetHistory(sessionId);
 
-        // SSE headers — must be set BEFORE writing body
         Response.ContentType = "text/event-stream";
         Response.Headers.CacheControl = "no-cache";
         Response.Headers.Connection = "keep-alive";
@@ -154,23 +120,19 @@ public class ChatController : ControllerBase
             prompt = request.Message;
         }
 
-        // Send sources first so client knows which docs were used
         await WriteSseEventAsync(Response, new { type = "sources", sessionId, sources }, cancellationToken);
 
-        // Stream tokens as they arrive from Gemini
         var fullResponse = new System.Text.StringBuilder();
 
-        await foreach (var token in _geminiService.StreamResponseAsync(
+        await foreach (var token in _chatService.StreamResponseAsync(
             prompt, history, cancellationToken))
         {
             fullResponse.Append(token);
             await WriteSseEventAsync(Response, new { type = "token", token }, cancellationToken);
         }
 
-        // Signal stream is complete
         await WriteSseEventAsync(Response, new { type = "done" }, cancellationToken);
 
-        // Save to conversation history (same as non-streaming)
         _chatHistoryService.AddMessage(sessionId, new ChatMessage
         {
             Role = "user",
@@ -183,12 +145,6 @@ public class ChatController : ControllerBase
         });
     }
 
-    /// <summary>
-    /// Write a single SSE event.
-    /// Format: "data: {json}\n\n"
-    /// The double newline is REQUIRED by SSE spec — it marks event boundary.
-    /// FlushAsync forces bytes to network — without it, buffering kills streaming.
-    /// </summary>
     private static async Task WriteSseEventAsync(
         HttpResponse response, object data, CancellationToken cancellationToken)
     {
@@ -197,9 +153,6 @@ public class ChatController : ControllerBase
         await response.Body.FlushAsync(cancellationToken);
     }
 
-    /// <summary>
-    /// Clear conversation history for a session.
-    /// </summary>
     [HttpDelete("{sessionId}")]
     public IActionResult ClearSession(string sessionId)
     {

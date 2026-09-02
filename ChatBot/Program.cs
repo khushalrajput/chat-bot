@@ -2,6 +2,7 @@ using ChatBot.Data;
 using ChatBot.Services;
 using ChatBot.Settings;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.SemanticKernel;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -9,26 +10,46 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<GeminiSettings>(
     builder.Configuration.GetSection(GeminiSettings.SectionName));
 
-// --- Database ---
-// SQLite stores data in a single file. Path relative to app root.
-// EnsureCreated() below will create the file + tables if missing.
-builder.Services.AddDbContext<ChatBotDbContext>(options =>
-    options.UseSqlite("Data Source=chatbot.db"));
+// Read settings for SK registration
+var geminiSettings = builder.Configuration
+    .GetSection(GeminiSettings.SectionName)
+    .Get<GeminiSettings>()!;
 
-// --- Service Registration ---
-builder.Services.AddHttpClient<IGeminiService, GeminiService>(client =>
-{
-    client.Timeout = TimeSpan.FromSeconds(30);
-});
+// --- Semantic Kernel Registration ---
+//
+// THIS IS THE KEY PART. Compare with old raw HTTP setup:
+//
+// OLD:
+//   builder.Services.AddHttpClient<IGeminiService, GeminiService>(...);
+//   builder.Services.AddHttpClient<IEmbeddingService, EmbeddingService>(...);
+//   + GeminiRequest/Response DTOs
+//   + Manual JSON serialization
+//   + Manual SSE parsing
+//
+// NEW:
+//   Two lines. SK handles HTTP, JSON, auth, SSE, retries internally.
+//
+// SWAP PROVIDER: Change these two lines to AddOpenAIChatCompletion / AddOpenAITextEmbeddingGeneration
+// and the entire app works with OpenAI. Zero changes anywhere else.
 
-builder.Services.AddHttpClient<IEmbeddingService, EmbeddingService>(client =>
-{
-    client.Timeout = TimeSpan.FromSeconds(30);
-});
+builder.Services.AddGoogleAIGeminiChatCompletion(
+    modelId: geminiSettings.Model,
+    apiKey: geminiSettings.ApiKey);
 
+builder.Services.AddGoogleAIEmbeddingGeneration(
+    modelId: "gemini-embedding-001",
+    apiKey: geminiSettings.ApiKey);
+
+// --- Our Services (unchanged from before) ---
+builder.Services.AddScoped<IChatService, ChatService>();
+builder.Services.AddScoped<IEmbeddingService, EmbeddingService>();
 builder.Services.AddScoped<IDocumentService, DocumentService>();
 builder.Services.AddSingleton<IVectorStoreService, VectorStoreService>();
 builder.Services.AddSingleton<IChatHistoryService, ChatHistoryService>();
+
+// --- Database ---
+builder.Services.AddDbContext<ChatBotDbContext>(options =>
+    options.UseSqlite("Data Source=chatbot.db"));
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
@@ -36,12 +57,6 @@ builder.Services.AddOpenApi();
 var app = builder.Build();
 
 // --- Database Initialization ---
-// EnsureCreated: creates DB + tables if they don't exist.
-// For learning this is fine. Production uses migrations (dotnet ef migrations add).
-//
-// WHY at startup?
-// App should be ready to serve requests immediately.
-// No "first request creates the DB" surprise.
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<ChatBotDbContext>();
