@@ -1,5 +1,7 @@
+using ChatBot.Data;
 using ChatBot.Services;
 using ChatBot.Settings;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -7,39 +9,48 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<GeminiSettings>(
     builder.Configuration.GetSection(GeminiSettings.SectionName));
 
-// --- Service Registration ---
+// --- Database ---
+// SQLite stores data in a single file. Path relative to app root.
+// EnsureCreated() below will create the file + tables if missing.
+builder.Services.AddDbContext<ChatBotDbContext>(options =>
+    options.UseSqlite("Data Source=chatbot.db"));
 
-// Typed HttpClient for LLM generation (chat responses)
+// --- Service Registration ---
 builder.Services.AddHttpClient<IGeminiService, GeminiService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(30);
 });
 
-// Typed HttpClient for embedding API (separate client = separate pool)
-// WHY separate HttpClient? Different endpoints may have different:
-// - Timeout requirements (embedding is faster than generation)
-// - Rate limits (embedding has higher throughput)
-// - Retry policies (add Polly later per-client)
 builder.Services.AddHttpClient<IEmbeddingService, EmbeddingService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(30);
 });
 
-// Document processing — stateless, scoped is fine
 builder.Services.AddScoped<IDocumentService, DocumentService>();
-
-// Vector store — SINGLETON: must persist across requests.
-// Scoped/transient = new empty store per request = data lost.
 builder.Services.AddSingleton<IVectorStoreService, VectorStoreService>();
-
-// Chat history — SINGLETON: same reason as vector store.
-// Must persist across requests so conversations continue.
 builder.Services.AddSingleton<IChatHistoryService, ChatHistoryService>();
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
+
+// --- Database Initialization ---
+// EnsureCreated: creates DB + tables if they don't exist.
+// For learning this is fine. Production uses migrations (dotnet ef migrations add).
+//
+// WHY at startup?
+// App should be ready to serve requests immediately.
+// No "first request creates the DB" surprise.
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<ChatBotDbContext>();
+    await db.Database.EnsureCreatedAsync();
+}
+
+// Load persisted vectors into memory cache
+var vectorStore = app.Services.GetRequiredService<IVectorStoreService>();
+await vectorStore.InitializeAsync();
 
 if (app.Environment.IsDevelopment())
 {
