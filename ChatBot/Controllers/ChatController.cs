@@ -153,6 +153,20 @@ public class ChatController : ControllerBase
         await response.Body.FlushAsync(cancellationToken);
     }
 
+    [HttpGet("sessions")]
+    public IActionResult GetSessions()
+    {
+        var sessions = _chatHistoryService.GetAllSessions();
+        return Ok(sessions);
+    }
+
+    [HttpGet("sessions/{sessionId}")]
+    public IActionResult GetSessionHistory(string sessionId)
+    {
+        var history = _chatHistoryService.GetHistory(sessionId);
+        return Ok(new { sessionId, messages = history });
+    }
+
     [HttpDelete("{sessionId}")]
     public IActionResult ClearSession(string sessionId)
     {

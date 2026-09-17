@@ -76,17 +76,24 @@ public class VectorStoreService : IVectorStoreService
 
     public void AddChunks(List<DocumentChunk> chunks)
     {
-        // Write to SQLite
+        if (chunks.Count == 0) return;
+
+        // Write to SQLite — remove old chunks for same document first (re-upload support)
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<ChatBotDbContext>();
+
+        var documentName = chunks[0].DocumentName;
+        var existing = db.DocumentChunks.Where(c => c.DocumentName == documentName);
+        db.DocumentChunks.RemoveRange(existing);
 
         var entities = chunks.Select(ChunkToEntity).ToList();
         db.DocumentChunks.AddRange(entities);
         db.SaveChanges();
 
-        // Update memory cache
+        // Update memory cache — replace old chunks for same document
         lock (_lock)
         {
+            _cache.RemoveAll(c => c.DocumentName == documentName);
             _cache.AddRange(chunks);
         }
 

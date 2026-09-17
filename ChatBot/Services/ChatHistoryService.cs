@@ -65,4 +65,25 @@ public class ChatHistoryService : IChatHistoryService
         _sessions.TryRemove(sessionId, out _);
         _logger.LogDebug("Session {SessionId}: history cleared", sessionId);
     }
+
+    public List<SessionInfo> GetAllSessions()
+    {
+        return _sessions
+            .Where(kvp => kvp.Value.Count > 0)
+            .Select(kvp =>
+            {
+                var messages = kvp.Value;
+                var firstUserMsg = messages.FirstOrDefault(m => m.Role == "user");
+                var preview = firstUserMsg?.Content ?? "Empty chat";
+                if (preview.Length > 50) preview = preview[..50] + "...";
+
+                return new SessionInfo(
+                    kvp.Key,
+                    preview,
+                    messages.Count,
+                    messages[^1].Timestamp);
+            })
+            .OrderByDescending(s => s.LastActivity)
+            .ToList();
+    }
 }

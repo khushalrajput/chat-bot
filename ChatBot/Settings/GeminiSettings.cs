@@ -11,4 +11,6 @@ public class GeminiSettings
     public required string ApiKey { get; set; }
 
     public string Model { get; set; } = "gemini-3.1-flash-lite";
+
+    public string EmbeddingModel { get; set; } = "gemini-embedding-001";
 }

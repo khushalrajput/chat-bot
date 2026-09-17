@@ -37,7 +37,7 @@ builder.Services.AddGoogleAIGeminiChatCompletion(
     apiKey: geminiSettings.ApiKey);
 
 builder.Services.AddGoogleAIEmbeddingGeneration(
-    modelId: "gemini-embedding-001",
+    modelId: geminiSettings.EmbeddingModel,
     apiKey: geminiSettings.ApiKey);
 
 // --- Our Services (unchanged from before) ---
@@ -73,6 +73,8 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseDefaultFiles();
+app.UseStaticFiles();
 app.UseAuthorization();
 app.MapControllers();
 
