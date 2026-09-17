@@ -22,4 +22,11 @@ public interface IChatHistoryService
     /// Clear history for a session (start fresh).
     /// </summary>
     void ClearHistory(string sessionId);
+
+    /// <summary>
+    /// Get all active session IDs with their first user message as preview.
+    /// </summary>
+    List<SessionInfo> GetAllSessions();
 }
+
+public record SessionInfo(string SessionId, string Preview, int MessageCount, DateTime LastActivity);

@@ -1,69 +1,114 @@
-using System.Numerics;
+using ChatBot.Data;
+using ChatBot.Data.Entities;
 using ChatBot.Models;
+using Microsoft.EntityFrameworkCore;
 
 namespace ChatBot.Services;
 
 /// <summary>
-/// In-memory vector store with cosine similarity search.
+/// SQLite-backed vector store with in-memory cache for fast search.
 ///
-/// WHY in-memory first?
-/// - Zero infrastructure — learn the concept without database setup
-/// - Fast for small datasets (our policy doc = ~20 chunks)
-/// - Same interface → swap to Qdrant/Pinecone/pgvector later without changing consumers
+/// PATTERN: Write-through cache
+/// - AddChunks: write to SQLite AND memory cache simultaneously
+/// - Search: always from memory cache (fast cosine similarity)
+/// - Startup: load all from SQLite into memory cache
 ///
-/// PRODUCTION: Replace with a real vector database when:
-/// - Data exceeds memory (>100K chunks)
-/// - Need persistence across restarts
-/// - Need distributed search
-/// - Need filtering (e.g., search only "HR" category docs)
+/// WHY not search directly from SQLite?
+/// SQLite has no vector similarity functions. We'd have to:
+/// 1. Load ALL embeddings from DB
+/// 2. Deserialize byte[] → float[]
+/// 3. Calculate cosine similarity
+/// That's what we do — but cached in memory so step 1-2 happen once at startup.
 ///
-/// Popular options: Qdrant (open source), Pinecone (managed), pgvector (PostgreSQL extension)
+/// REGISTERED AS SINGLETON — one cache for entire app lifetime.
+/// Uses IServiceScopeFactory to create scoped DbContext instances.
 ///
-/// REGISTERED AS SINGLETON — one shared store for entire app lifecycle.
-/// If registered as scoped/transient, each request gets empty store. Bad.
+/// WHY IServiceScopeFactory?
+/// DbContext is scoped (one per HTTP request). Singleton can't inject scoped directly.
+/// IServiceScopeFactory lets singleton create temporary scopes to get DbContext.
+/// This is standard EF Core pattern for singletons and background services.
 /// </summary>
 public class VectorStoreService : IVectorStoreService
 {
-    private readonly List<DocumentChunk> _chunks = [];
+    private readonly List<DocumentChunk> _cache = [];
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<VectorStoreService> _logger;
-    private readonly object _lock = new(); // Thread safety for concurrent requests
+    private readonly object _lock = new();
+    private bool _initialized;
 
-    public VectorStoreService(ILogger<VectorStoreService> logger)
+    public VectorStoreService(
+        IServiceScopeFactory scopeFactory,
+        ILogger<VectorStoreService> logger)
     {
+        _scopeFactory = scopeFactory;
         _logger = logger;
     }
 
     public int ChunkCount
     {
-        get { lock (_lock) return _chunks.Count; }
+        get { lock (_lock) return _cache.Count; }
+    }
+
+    /// <summary>
+    /// Load all chunks from SQLite into memory cache.
+    /// Called once at startup. If DB is empty, cache stays empty.
+    /// </summary>
+    public async Task InitializeAsync()
+    {
+        if (_initialized) return;
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ChatBotDbContext>();
+
+        var entities = await db.DocumentChunks.ToListAsync();
+
+        lock (_lock)
+        {
+            foreach (var entity in entities)
+            {
+                _cache.Add(EntityToChunk(entity));
+            }
+            _initialized = true;
+        }
+
+        _logger.LogInformation("Loaded {Count} chunks from database", entities.Count);
     }
 
     public void AddChunks(List<DocumentChunk> chunks)
     {
+        if (chunks.Count == 0) return;
+
+        // Write to SQLite — remove old chunks for same document first (re-upload support)
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ChatBotDbContext>();
+
+        var documentName = chunks[0].DocumentName;
+        var existing = db.DocumentChunks.Where(c => c.DocumentName == documentName);
+        db.DocumentChunks.RemoveRange(existing);
+
+        var entities = chunks.Select(ChunkToEntity).ToList();
+        db.DocumentChunks.AddRange(entities);
+        db.SaveChanges();
+
+        // Update memory cache — replace old chunks for same document
         lock (_lock)
         {
-            _chunks.AddRange(chunks);
+            _cache.RemoveAll(c => c.DocumentName == documentName);
+            _cache.AddRange(chunks);
         }
 
-        _logger.LogInformation("Added {Count} chunks. Total: {Total}", chunks.Count, ChunkCount);
+        _logger.LogInformation(
+            "Persisted {Count} chunks to DB. Total in cache: {Total}",
+            chunks.Count, ChunkCount);
     }
 
     public List<DocumentChunk> Search(float[] queryEmbedding, int topK = 3)
     {
         lock (_lock)
         {
-            if (_chunks.Count == 0)
-                return [];
+            if (_cache.Count == 0) return [];
 
-            // Calculate similarity between query and EVERY stored chunk
-            // Then return top K most similar
-            //
-            // TIME COMPLEXITY: O(n) — scans all chunks.
-            // Fine for hundreds/thousands. At millions, need approximate
-            // nearest neighbor (ANN) algorithms like HNSW — that's what
-            // real vector DBs implement.
-
-            return _chunks
+            return _cache
                 .Where(c => c.Embedding is not null)
                 .Select(chunk => new
                 {
@@ -81,21 +126,47 @@ public class VectorStoreService : IVectorStoreService
         }
     }
 
+    // --- Conversion helpers: Domain ↔ Entity ---
+
     /// <summary>
-    /// COSINE SIMILARITY — the heart of vector search.
-    ///
-    /// Measures the angle between two vectors, not their magnitude.
-    /// Formula: cos(θ) = (A · B) / (|A| × |B|)
-    ///
-    /// Why cosine and not Euclidean distance?
-    /// - Cosine ignores vector length, focuses on direction
-    /// - "leave policy" and "LEAVE POLICY" might have different magnitudes
-    ///   but same direction → cosine treats them as identical
-    /// - Range: -1 to 1 (1 = same direction, 0 = orthogonal, -1 = opposite)
-    ///
-    /// Using SIMD (System.Numerics.Vector) for hardware-accelerated math.
-    /// On modern CPUs, processes 8 floats per instruction instead of 1.
+    /// float[] → byte[] for SQLite BLOB storage.
+    /// Buffer.BlockCopy is fastest way to convert float arrays to bytes.
+    /// No serialization overhead — direct memory copy.
     /// </summary>
+    private static DocumentChunkEntity ChunkToEntity(DocumentChunk chunk)
+    {
+        byte[] blob = new byte[chunk.Embedding!.Length * sizeof(float)];
+        Buffer.BlockCopy(chunk.Embedding, 0, blob, 0, blob.Length);
+
+        return new DocumentChunkEntity
+        {
+            ChunkId = chunk.Id,
+            DocumentName = chunk.DocumentName,
+            Content = chunk.Content,
+            ChunkIndex = chunk.ChunkIndex,
+            EmbeddingBlob = blob
+        };
+    }
+
+    /// <summary>
+    /// byte[] → float[] for in-memory search.
+    /// Reverse of above — direct memory copy, zero parsing.
+    /// </summary>
+    private static DocumentChunk EntityToChunk(DocumentChunkEntity entity)
+    {
+        float[] embedding = new float[entity.EmbeddingBlob.Length / sizeof(float)];
+        Buffer.BlockCopy(entity.EmbeddingBlob, 0, embedding, 0, entity.EmbeddingBlob.Length);
+
+        return new DocumentChunk
+        {
+            Id = entity.ChunkId,
+            DocumentName = entity.DocumentName,
+            Content = entity.Content,
+            ChunkIndex = entity.ChunkIndex,
+            Embedding = embedding
+        };
+    }
+
     private static float CosineSimilarity(float[] a, float[] b)
     {
         if (a.Length != b.Length)
@@ -103,7 +174,6 @@ public class VectorStoreService : IVectorStoreService
 
         float dot = 0, normA = 0, normB = 0;
 
-        // SIMD-friendly loop — .NET JIT auto-vectorizes this
         for (int i = 0; i < a.Length; i++)
         {
             dot += a[i] * b[i];

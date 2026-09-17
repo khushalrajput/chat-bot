@@ -1,5 +1,8 @@
+using ChatBot.Data;
 using ChatBot.Services;
 using ChatBot.Settings;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.SemanticKernel;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -7,39 +10,62 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<GeminiSettings>(
     builder.Configuration.GetSection(GeminiSettings.SectionName));
 
-// --- Service Registration ---
+// Read settings for SK registration
+var geminiSettings = builder.Configuration
+    .GetSection(GeminiSettings.SectionName)
+    .Get<GeminiSettings>()!;
 
-// Typed HttpClient for LLM generation (chat responses)
-builder.Services.AddHttpClient<IGeminiService, GeminiService>(client =>
-{
-    client.Timeout = TimeSpan.FromSeconds(30);
-});
+// --- Semantic Kernel Registration ---
+//
+// THIS IS THE KEY PART. Compare with old raw HTTP setup:
+//
+// OLD:
+//   builder.Services.AddHttpClient<IGeminiService, GeminiService>(...);
+//   builder.Services.AddHttpClient<IEmbeddingService, EmbeddingService>(...);
+//   + GeminiRequest/Response DTOs
+//   + Manual JSON serialization
+//   + Manual SSE parsing
+//
+// NEW:
+//   Two lines. SK handles HTTP, JSON, auth, SSE, retries internally.
+//
+// SWAP PROVIDER: Change these two lines to AddOpenAIChatCompletion / AddOpenAITextEmbeddingGeneration
+// and the entire app works with OpenAI. Zero changes anywhere else.
 
-// Typed HttpClient for embedding API (separate client = separate pool)
-// WHY separate HttpClient? Different endpoints may have different:
-// - Timeout requirements (embedding is faster than generation)
-// - Rate limits (embedding has higher throughput)
-// - Retry policies (add Polly later per-client)
-builder.Services.AddHttpClient<IEmbeddingService, EmbeddingService>(client =>
-{
-    client.Timeout = TimeSpan.FromSeconds(30);
-});
+builder.Services.AddGoogleAIGeminiChatCompletion(
+    modelId: geminiSettings.Model,
+    apiKey: geminiSettings.ApiKey);
 
-// Document processing — stateless, scoped is fine
+builder.Services.AddGoogleAIEmbeddingGeneration(
+    modelId: geminiSettings.EmbeddingModel,
+    apiKey: geminiSettings.ApiKey);
+
+// --- Our Services (unchanged from before) ---
+builder.Services.AddScoped<IChatService, ChatService>();
+builder.Services.AddScoped<IEmbeddingService, EmbeddingService>();
 builder.Services.AddScoped<IDocumentService, DocumentService>();
-
-// Vector store — SINGLETON: must persist across requests.
-// Scoped/transient = new empty store per request = data lost.
 builder.Services.AddSingleton<IVectorStoreService, VectorStoreService>();
-
-// Chat history — SINGLETON: same reason as vector store.
-// Must persist across requests so conversations continue.
 builder.Services.AddSingleton<IChatHistoryService, ChatHistoryService>();
+
+// --- Database ---
+builder.Services.AddDbContext<ChatBotDbContext>(options =>
+    options.UseSqlite("Data Source=chatbot.db"));
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
+
+// --- Database Initialization ---
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<ChatBotDbContext>();
+    await db.Database.EnsureCreatedAsync();
+}
+
+// Load persisted vectors into memory cache
+var vectorStore = app.Services.GetRequiredService<IVectorStoreService>();
+await vectorStore.InitializeAsync();
 
 if (app.Environment.IsDevelopment())
 {
@@ -47,6 +73,8 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseDefaultFiles();
+app.UseStaticFiles();
 app.UseAuthorization();
 app.MapControllers();
 
