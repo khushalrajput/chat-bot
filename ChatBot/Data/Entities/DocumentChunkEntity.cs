@@ -28,6 +28,22 @@ public class DocumentChunkEntity
     public int ChunkIndex { get; set; }
 
     /// <summary>
+    /// Section heading from the document (e.g., "Director's Message").
+    /// Nullable — plain text chunks always have one, but edge cases exist.
+    /// </summary>
+    public string? SectionTitle { get; set; }
+
+    /// <summary>
+    /// Page number in the original PDF (1-based).
+    /// </summary>
+    public int PageNumber { get; set; }
+
+    /// <summary>
+    /// Content type: "paragraph", "table", "figure", etc.
+    /// </summary>
+    public string ChunkType { get; set; } = "paragraph";
+
+    /// <summary>
     /// Embedding stored as byte[] (BLOB in SQLite).
     ///
     /// WHY bytes not float[]?

@@ -10,26 +10,32 @@ public class DocumentController : ControllerBase
     private readonly IDocumentService _documentService;
     private readonly IEmbeddingService _embeddingService;
     private readonly IVectorStoreService _vectorStoreService;
+    private readonly PdfTextExtractor _pdfTextExtractor;
 
     public DocumentController(
         IDocumentService documentService,
         IEmbeddingService embeddingService,
-        IVectorStoreService vectorStoreService)
+        IVectorStoreService vectorStoreService,
+        PdfTextExtractor pdfTextExtractor)
     {
         _documentService = documentService;
         _embeddingService = embeddingService;
         _vectorStoreService = vectorStoreService;
+        _pdfTextExtractor = pdfTextExtractor;
     }
 
     /// <summary>
-    /// Ingest a text document into the RAG pipeline.
-    /// This is the FULL ingestion pipeline in one endpoint:
-    /// Upload → Parse → Chunk → Embed → Store
+    /// Ingest a document (PDF or TXT) into the RAG pipeline.
+    /// Full pipeline: Upload → Extract Text → Chunk → Embed → Store
+    ///
+    /// WHAT CHANGED FROM BEFORE:
+    /// - Now accepts .pdf files (via PdfTextExtractor) in addition to .txt
+    /// - PDF extraction preserves page numbers and paragraph structure
+    /// - Chunks now carry metadata (section, page, type) for source citations
     ///
     /// PRODUCTION CONSIDERATION:
     /// In real apps, ingestion is async (queue-based).
-    /// Embedding 1000 chunks takes time — don't block the HTTP request.
-    /// Use background jobs (Hangfire, Azure Service Bus, etc.)
+    /// Embedding 100+ chunks takes time — don't block the HTTP request.
     /// For learning: synchronous is fine.
     /// </summary>
     [HttpPost("upload")]
@@ -40,14 +46,27 @@ public class DocumentController : ControllerBase
         if (file is null || file.Length == 0)
             return BadRequest(new { error = "File is required" });
 
-        if (!file.FileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
-            return BadRequest(new { error = "Only .txt files supported for now" });
+        var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+        if (extension is not ".txt" and not ".pdf")
+            return BadRequest(new { error = "Only .txt and .pdf files are supported" });
 
-        // Step 1: Read file content
-        using var reader = new StreamReader(file.OpenReadStream());
-        var content = await reader.ReadToEndAsync(cancellationToken);
+        // Step 1: Extract text based on file type
+        string content;
 
-        // Step 2: Chunk the document
+        if (extension == ".pdf")
+        {
+            // PDF: extract text with page markers using PdfPig
+            using var stream = file.OpenReadStream();
+            content = _pdfTextExtractor.ExtractText(stream);
+        }
+        else
+        {
+            // TXT: read directly
+            using var reader = new StreamReader(file.OpenReadStream());
+            content = await reader.ReadToEndAsync(cancellationToken);
+        }
+
+        // Step 2: Chunk the document (narrative-aware chunking with metadata)
         var chunks = _documentService.ChunkDocument(file.FileName, content);
 
         // Step 3: Generate embeddings for all chunks (batch API call)
@@ -60,14 +79,16 @@ public class DocumentController : ControllerBase
             chunks[i].Embedding = embeddings[i];
         }
 
-        // Step 5: Store in vector store
+        // Step 5: Store in vector store (SQLite + memory cache)
         _vectorStoreService.AddChunks(chunks);
 
         return Ok(new
         {
             document = file.FileName,
+            fileType = extension,
             chunksCreated = chunks.Count,
             embeddingDimension = embeddings[0].Length,
+            averageChunkSize = (int)chunks.Average(c => c.Content.Length),
             totalChunksInStore = _vectorStoreService.ChunkCount
         });
     }

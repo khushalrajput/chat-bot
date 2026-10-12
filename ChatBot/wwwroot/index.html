@@ -360,9 +360,9 @@
         <!-- Upload Panel -->
         <div class="upload-panel" id="uploadPanel">
             <div class="upload-area" id="uploadArea">
-                <input type="file" id="fileInput" accept=".txt">
+                <input type="file" id="fileInput" accept=".txt,.pdf">
                 <div class="icon">&#128196;</div>
-                <p>Drop a .txt file here or click to upload</p>
+                <p>Drop a .txt or .pdf file here or click to upload</p>
             </div>
             <div class="upload-status" id="uploadStatus"></div>
         </div>
@@ -371,7 +371,7 @@
         <div class="messages" id="messages">
             <div class="welcome" id="welcome">
                 <h2>Welcome to RAG ChatBot</h2>
-                <p>Upload a .txt document using the &#128206; button,<br>then ask questions about it.</p>
+                <p>Upload a document (.txt or .pdf) using the &#128206; button,<br>then ask questions about it.</p>
             </div>
         </div>
 
@@ -567,8 +567,8 @@
         }
 
         async function uploadFile(file) {
-            if (!file.name.endsWith('.txt')) {
-                uploadStatus.textContent = 'Only .txt files are supported.';
+            if (!file.name.endsWith('.txt') && !file.name.endsWith('.pdf')) {
+                uploadStatus.textContent = 'Only .txt and .pdf files are supported.';
                 uploadStatus.className = 'upload-status error';
                 return;
             }
@@ -591,7 +591,7 @@
                 }
 
                 const data = await res.json();
-                uploadStatus.textContent = `"${data.document}" uploaded — ${data.chunksCreated} chunks created (${data.totalChunksInStore} total)`;
+                uploadStatus.textContent = `"${data.document}" uploaded — ${data.chunksCreated} chunks (avg ${data.averageChunkSize} chars, ${data.totalChunksInStore} total)`;
                 uploadStatus.className = 'upload-status success';
                 docStatus.textContent = `${data.totalChunksInStore} chunks`;
                 fileInput.value = '';
@@ -666,7 +666,10 @@
                                 if (sources.length > 0) {
                                     const srcEl = document.createElement('div');
                                     srcEl.className = 'sources';
-                                    srcEl.textContent = 'Sources: ' + sources.join(', ');
+                                    const srcText = sources.map(s =>
+                                        `${s.section || 'Unknown'} (p.${s.page})`
+                                    ).join(' | ');
+                                    srcEl.textContent = 'Sources: ' + srcText;
                                     botMsg.appendChild(srcEl);
                                 }
                             }

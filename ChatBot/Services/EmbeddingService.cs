@@ -42,27 +42,56 @@ public class EmbeddingService : IEmbeddingService
         return results[0];
     }
 
+    /// <summary>
+    /// Generate embeddings for a list of texts, batching to respect API limits.
+    ///
+    /// WHY BATCHING?
+    /// Gemini embedding API limits batch size (typically ~100 texts per call)
+    /// and has per-text token limits. An 82-page PDF produces 50-80+ chunks.
+    /// Sending all at once → 400 Bad Request.
+    ///
+    /// We chunk the embedding requests into groups of BatchSize,
+    /// call the API for each batch, and concatenate results.
+    /// </summary>
+    private const int BatchSize = 20; // Conservative — Gemini free tier is strict
+
     public async Task<List<float[]>> GetEmbeddingsAsync(
         List<string> texts,
         CancellationToken cancellationToken = default)
     {
-        _logger.LogDebug("Generating embeddings for {Count} texts", texts.Count);
+        _logger.LogInformation("Generating embeddings for {Count} texts in batches of {Batch}",
+            texts.Count, BatchSize);
 
-        // ONE LINE replaces entire batch embedding HTTP logic
-        // SK handles: batching, API calls, response parsing
-        var embeddings = await _embeddingService.GenerateEmbeddingsAsync(
-            texts,
-            cancellationToken: cancellationToken);
+        var allResults = new List<float[]>();
 
-        // SK returns ReadOnlyMemory<float> — convert to float[] for our vector store
-        // ReadOnlyMemory<float> is a zero-copy wrapper — ToArray() copies once
-        var result = embeddings
-            .Select(e => e.ToArray())
-            .ToList();
+        // Process in batches to stay within API limits
+        for (int i = 0; i < texts.Count; i += BatchSize)
+        {
+            var batch = texts.Skip(i).Take(BatchSize).ToList();
+            var batchNum = (i / BatchSize) + 1;
+            var totalBatches = (int)Math.Ceiling((double)texts.Count / BatchSize);
 
-        _logger.LogDebug("Generated {Count} embeddings, dimension={Dim}",
-            result.Count, result[0].Length);
+            _logger.LogInformation("Embedding batch {Batch}/{Total} ({Start}-{End})",
+                batchNum, totalBatches, i + 1, Math.Min(i + BatchSize, texts.Count));
 
-        return result;
+            var embeddings = await _embeddingService.GenerateEmbeddingsAsync(
+                batch,
+                cancellationToken: cancellationToken);
+
+            allResults.AddRange(embeddings.Select(e => e.ToArray()));
+
+            // Rate limit: Gemini free tier allows ~1500 RPM but enforces burst limits.
+            // Pause between batches to avoid connection resets.
+            if (i + BatchSize < texts.Count)
+            {
+                _logger.LogDebug("Waiting 2s before next batch (rate limit)");
+                await Task.Delay(2000, cancellationToken);
+            }
+        }
+
+        _logger.LogInformation("Generated {Count} embeddings, dimension={Dim}",
+            allResults.Count, allResults[0].Length);
+
+        return allResults;
     }
 }

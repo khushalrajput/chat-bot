@@ -40,10 +40,11 @@ builder.Services.AddGoogleAIEmbeddingGeneration(
     modelId: geminiSettings.EmbeddingModel,
     apiKey: geminiSettings.ApiKey);
 
-// --- Our Services (unchanged from before) ---
+// --- Our Services ---
 builder.Services.AddScoped<IChatService, ChatService>();
 builder.Services.AddScoped<IEmbeddingService, EmbeddingService>();
 builder.Services.AddScoped<IDocumentService, DocumentService>();
+builder.Services.AddScoped<PdfTextExtractor>();  // PDF text extraction via PdfPig
 builder.Services.AddSingleton<IVectorStoreService, VectorStoreService>();
 builder.Services.AddSingleton<IChatHistoryService, ChatHistoryService>();
 

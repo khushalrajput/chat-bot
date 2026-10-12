@@ -37,19 +37,25 @@ public class ChatController : ControllerBase
         var history = _chatHistoryService.GetHistory(sessionId);
 
         string response;
-        List<string> sources = [];
+        List<SourceInfo> sources = [];
 
         if (_vectorStoreService.ChunkCount > 0)
         {
             var queryEmbedding = await _embeddingService.GetEmbeddingAsync(
                 request.Message, cancellationToken);
 
-            var relevantChunks = _vectorStoreService.Search(queryEmbedding, topK: 3);
+            var relevantChunks = _vectorStoreService.Search(queryEmbedding);
 
-            var context = string.Join("\n\n---\n\n",
-                relevantChunks.Select(c => c.Content));
+            // Format context with metadata for source attribution
+            var context = FormatChunksAsContext(relevantChunks);
 
-            sources = relevantChunks.Select(c => c.Id).ToList();
+            // Build structured source info for response
+            sources = relevantChunks.Select(c => new SourceInfo
+            {
+                Document = c.DocumentName,
+                Section = c.SectionTitle,
+                Page = c.PageNumber
+            }).ToList();
 
             response = await _chatService.GetResponseAsync(
                 BuildRagPrompt(request.Message, context),
@@ -104,15 +110,22 @@ public class ChatController : ControllerBase
         Response.Headers.Connection = "keep-alive";
 
         string prompt;
-        List<string> sources = [];
+        List<SourceInfo> sources = [];
 
         if (_vectorStoreService.ChunkCount > 0)
         {
             var queryEmbedding = await _embeddingService.GetEmbeddingAsync(
                 request.Message, cancellationToken);
-            var relevantChunks = _vectorStoreService.Search(queryEmbedding, topK: 3);
-            var context = string.Join("\n\n---\n\n", relevantChunks.Select(c => c.Content));
-            sources = relevantChunks.Select(c => c.Id).ToList();
+            var relevantChunks = _vectorStoreService.Search(queryEmbedding);
+            var context = FormatChunksAsContext(relevantChunks);
+
+            sources = relevantChunks.Select(c => new SourceInfo
+            {
+                Document = c.DocumentName,
+                Section = c.SectionTitle,
+                Page = c.PageNumber
+            }).ToList();
+
             prompt = BuildRagPrompt(request.Message, context);
         }
         else
@@ -174,29 +187,80 @@ public class ChatController : ControllerBase
         return Ok(new { message = "Session cleared", sessionId });
     }
 
+    /// <summary>
+    /// Format retrieved chunks with metadata headers for the LLM.
+    ///
+    /// WHY include metadata in the context?
+    /// 1. LLM can cite the section and page in its answer — verifiable
+    /// 2. LLM uses section titles as disambiguation hints:
+    ///    "Library Services" section vs "Financial Summary" section
+    ///    helps when the same number appears in different contexts
+    /// 3. User can go to the exact page in the PDF to verify
+    ///
+    /// OLD format: "chunk text\n---\nchunk text"
+    /// NEW format: "[Source: doc | Section: ... | Page: N]\nchunk text"
+    /// </summary>
+    private static string FormatChunksAsContext(List<DocumentChunk> chunks)
+    {
+        return string.Join("\n\n---\n\n", chunks.Select(c =>
+            $"[Source: {c.DocumentName} | Section: {c.SectionTitle ?? "Unknown"} | Page: {c.PageNumber}]\n{c.Content}"));
+    }
+
+    /// <summary>
+    /// Build the RAG prompt — tightened for fact extraction.
+    ///
+    /// WHAT CHANGED FROM BEFORE:
+    /// - Explicit rule: quote numbers EXACTLY as written
+    /// - Explicit rule: cite section and page
+    /// - Explicit rule: never infer or calculate
+    /// - Explicit "I don't know" instruction — prevents hallucination
+    ///
+    /// WHY so strict?
+    /// GPO report has specific numbers: "802,834 copies", "304 libraries", "$94.9 million".
+    /// If LLM rounds "802,834" to "about 800,000" — the answer is WRONG.
+    /// The prompt must constrain the LLM to be a faithful reporter, not a summarizer.
+    /// </summary>
     private static string BuildRagPrompt(string question, string context)
     {
         return $"""
-            Answer the following question based ONLY on the provided context.
-            If the answer cannot be found in the context, clearly state that the information
-            is not available in the provided documents. Do not make up information.
+            You are a document Q&A assistant. Answer ONLY using the provided context.
 
-            Context from company documents:
+            Rules:
+            1. If the answer contains a number, statistic, or dollar amount, quote it EXACTLY as it appears in the source — do not round, paraphrase, or recalculate.
+            2. Cite the section and page number where you found the answer (e.g., "According to the Library Services section, page 42...").
+            3. If the context does not contain the answer, say: "This information is not available in the provided document."
+            4. Do NOT infer, extrapolate, or add information beyond what is explicitly stated in the context.
+            5. If multiple sections contain relevant information, synthesize them but cite each source.
+
+            Context from the document:
             {context}
 
             Question: {question}
 
-            Provide a clear, concise answer based on the context above.
+            Provide a clear, accurate answer with source citations.
             """;
     }
 }
 
 public record ChatRequest(string Message, string? SessionId = null);
 
+/// <summary>
+/// Structured source citation — tells the user exactly where the answer came from.
+///
+/// OLD: List of string chunk IDs like "GPO-report.pdf::chunk-4" — meaningless to users
+/// NEW: Document name, section heading, and page number — actionable for verification
+/// </summary>
+public record SourceInfo
+{
+    public required string Document { get; init; }
+    public string? Section { get; init; }
+    public int Page { get; init; }
+}
+
 public record ChatResponse
 {
     public required string SessionId { get; init; }
     public required string Message { get; init; }
     public required string Response { get; init; }
-    public List<string> Sources { get; init; } = [];
+    public List<SourceInfo> Sources { get; init; } = [];
 }

@@ -30,6 +30,26 @@ public class DocumentChunk
     public int ChunkIndex { get; set; }
 
     /// <summary>
+    /// The nearest section heading above this chunk in the original document.
+    /// Example: "Library Services and Content Management"
+    /// Used for: source citations, context in RAG prompt.
+    /// </summary>
+    public string? SectionTitle { get; set; }
+
+    /// <summary>
+    /// Page number in the original PDF where this chunk starts.
+    /// Used for: source citations so users can verify answers.
+    /// </summary>
+    public int PageNumber { get; set; }
+
+    /// <summary>
+    /// What kind of content this chunk holds.
+    /// For Use Case 1 (narrative text): always "paragraph".
+    /// Future use cases will add "table", "figure", "list".
+    /// </summary>
+    public string ChunkType { get; set; } = "paragraph";
+
+    /// <summary>
     /// The embedding vector — list of floats representing meaning.
     /// Gemini embedding-001 produces 768-dimensional vectors.
     /// Two chunks with similar meaning = similar vectors = close in vector space.

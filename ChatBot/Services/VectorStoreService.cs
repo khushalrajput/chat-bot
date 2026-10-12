@@ -83,11 +83,32 @@ public class VectorStoreService : IVectorStoreService
         var db = scope.ServiceProvider.GetRequiredService<ChatBotDbContext>();
 
         var documentName = chunks[0].DocumentName;
-        var existing = db.DocumentChunks.Where(c => c.DocumentName == documentName);
-        db.DocumentChunks.RemoveRange(existing);
+
+        // Use ExecuteDelete for direct SQL DELETE — no loading entities into memory,
+        // no change tracker conflicts, and guaranteed to flush before the insert.
+        var deleted = db.DocumentChunks
+            .Where(c => c.DocumentName == documentName)
+            .ExecuteDelete();
+
+        if (deleted > 0)
+            _logger.LogInformation("Deleted {Count} old chunks for '{Doc}'", deleted, documentName);
 
         var entities = chunks.Select(ChunkToEntity).ToList();
-        db.DocumentChunks.AddRange(entities);
+
+        // Deduplicate by ChunkId — defensive guard against chunking producing duplicates
+        var uniqueEntities = entities
+            .GroupBy(e => e.ChunkId)
+            .Select(g => g.First())
+            .ToList();
+
+        if (uniqueEntities.Count != entities.Count)
+        {
+            _logger.LogWarning(
+                "Removed {Count} duplicate chunk IDs before insert",
+                entities.Count - uniqueEntities.Count);
+        }
+
+        db.DocumentChunks.AddRange(uniqueEntities);
         db.SaveChanges();
 
         // Update memory cache — replace old chunks for same document
@@ -102,13 +123,13 @@ public class VectorStoreService : IVectorStoreService
             chunks.Count, ChunkCount);
     }
 
-    public List<DocumentChunk> Search(float[] queryEmbedding, int topK = 3)
+    public List<DocumentChunk> Search(float[] queryEmbedding, int topK = 5, float minScore = 0.3f)
     {
         lock (_lock)
         {
             if (_cache.Count == 0) return [];
 
-            return _cache
+            var results = _cache
                 .Where(c => c.Embedding is not null)
                 .Select(chunk => new
                 {
@@ -116,13 +137,19 @@ public class VectorStoreService : IVectorStoreService
                     Score = CosineSimilarity(queryEmbedding, chunk.Embedding!)
                 })
                 .OrderByDescending(x => x.Score)
+                .Where(x => x.Score >= minScore) // Filter noise — only keep relevant chunks
                 .Take(topK)
-                .Select(x =>
-                {
-                    _logger.LogDebug("Match: {Id} (score: {Score:F4})", x.Chunk.Id, x.Score);
-                    return x.Chunk;
-                })
                 .ToList();
+
+            // Log scores for debugging retrieval quality
+            foreach (var r in results)
+            {
+                _logger.LogInformation(
+                    "Match: {Id} | Section: {Section} | Page: {Page} | Score: {Score:F4}",
+                    r.Chunk.Id, r.Chunk.SectionTitle, r.Chunk.PageNumber, r.Score);
+            }
+
+            return results.Select(x => x.Chunk).ToList();
         }
     }
 
@@ -144,6 +171,9 @@ public class VectorStoreService : IVectorStoreService
             DocumentName = chunk.DocumentName,
             Content = chunk.Content,
             ChunkIndex = chunk.ChunkIndex,
+            SectionTitle = chunk.SectionTitle,
+            PageNumber = chunk.PageNumber,
+            ChunkType = chunk.ChunkType,
             EmbeddingBlob = blob
         };
     }
@@ -163,6 +193,9 @@ public class VectorStoreService : IVectorStoreService
             DocumentName = entity.DocumentName,
             Content = entity.Content,
             ChunkIndex = entity.ChunkIndex,
+            SectionTitle = entity.SectionTitle,
+            PageNumber = entity.PageNumber,
+            ChunkType = entity.ChunkType,
             Embedding = embedding
         };
     }
