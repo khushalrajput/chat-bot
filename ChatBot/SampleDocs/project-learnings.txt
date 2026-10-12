@@ -1,0 +1,176 @@
+========================================================================
+  RAG CHATBOT — PROJECT SUMMARY & LEARNINGS
+========================================================================
+
+PROJECT OVERVIEW
+----------------
+A Retrieval-Augmented Generation (RAG) chatbot built with .NET 10 Web API
+and Google Gemini AI. Users upload text documents, the system chunks and
+embeds them, then answers questions using only the uploaded content as
+context. The frontend is a single-page HTML chatbot UI served from the
+same origin.
+
+TECHNICAL STACK
+---------------
+- Runtime:          .NET 10 (ASP.NET Core Web API)
+- AI Framework:     Microsoft Semantic Kernel 1.80.0
+- LLM Provider:     Google Gemini (gemini-3.1-flash-lite)
+- Embedding Model:  Gemini embedding-001 (768-dimensional vectors)
+- Database:         SQLite via Entity Framework Core
+- Frontend:         Vanilla HTML/CSS/JavaScript 
+- Streaming:        Server-Sent Events (SSE)
+- Architecture:     Clean service layer with dependency injection
+
+========================================================================
+  WHAT I LEARNED — PHASE BY PHASE
+========================================================================
+
+PHASE 1: BASIC CHATBOT (Raw HTTP)
+----------------------------------
+- How to call Gemini REST API directly using HttpClient
+- Building request/response DTOs (GeminiRequest, GeminiResponse)
+- Manual JSON serialization for LLM API calls
+- API key management via appsettings.json and User Secrets
+- Basic ASP.NET Core Web API structure (Controllers, DI, routing)
+
+PHASE 2: RAG PIPELINE (Document Ingestion)
+-------------------------------------------
+- Document chunking strategies:
+  * Section-based splitting (regex on numbered headings)
+  * Paragraph-based fallback for large sections
+  * Overlap between chunks (50 chars) to prevent boundary info loss
+- Embedding generation: converting text to 768-dimension float vectors
+- Vector similarity search using cosine similarity
+- In-memory vector store with List<DocumentChunk>
+- The full RAG pipeline: Upload -> Parse -> Chunk -> Embed -> Store -> Retrieve -> Augment -> Generate
+- Why chunk-level retrieval beats document-level (precision)
+- Prompt engineering for RAG: instructing LLM to answer ONLY from context
+
+PHASE 3: PERSISTENCE WITH SQLITE & EF CORE
+---------------------------------------------
+- Entity Framework Core with SQLite provider
+- Domain model vs persistence model separation:
+  * DocumentChunk (float[] Embedding for in-memory math)
+  * DocumentChunkEntity (byte[] EmbeddingBlob for DB storage)
+- Binary conversion: float[] <-> byte[] using Buffer.BlockCopy
+- Write-through cache pattern:
+  * Write to DB AND memory cache simultaneously
+  * Read/search always from memory cache (fast cosine similarity)
+  * Startup: load all from DB into memory
+- Singleton service with IServiceScopeFactory to create scoped DbContext
+- Database indexing: unique index on ChunkId, index on DocumentName
+- EnsureCreatedAsync() for auto table creation
+
+PHASE 4: SSE STREAMING
+------------------------
+- Server-Sent Events (SSE) protocol: "data: {json}\n\n" format
+- IAsyncEnumerable<string> for token-by-token streaming from LLM
+- Response.ContentType = "text/event-stream" with no-cache headers
+- Frontend: ReadableStream reader with TextDecoder for consuming SSE
+- Structured SSE events: sources, token, done (typed event protocol)
+- StringBuilder to accumulate full response for chat history storage
+
+PHASE 5: SEMANTIC KERNEL MIGRATION
+-------------------------------------
+- Microsoft Semantic Kernel as AI abstraction layer
+- Replaced ~200 lines of raw HTTP/JSON code with 2 DI registrations:
+  * AddGoogleAIGeminiChatCompletion()
+  * AddGoogleAIEmbeddingGeneration()
+- IChatCompletionService: provider-agnostic chat interface
+- ITextEmbeddingGenerationService: provider-agnostic embedding interface
+- ChatHistory: SK's built-in conversation history type
+  * Handles role mapping (SK "Assistant" -> Gemini "model") internally
+  * Supports system messages, user messages, assistant messages
+- GetStreamingChatMessageContentsAsync() replaces manual SSE parsing
+- Provider swappability: change 2 lines in Program.cs to switch from
+  Gemini to OpenAI — zero changes in service layer
+- Alpha NuGet package for Google connector (Connectors.Google)
+
+PHASE 6: FRONTEND & SESSION MANAGEMENT
+-----------------------------------------
+- Serving static files from wwwroot (UseDefaultFiles + UseStaticFiles)
+- Same-origin serving eliminates CORS configuration
+- Chat UI with WhatsApp-style message bubbles
+- Drag-and-drop file upload with FormData API
+- SSE consumption in browser using fetch + ReadableStream
+- Session management:
+  * ConcurrentDictionary for thread-safe session storage
+  * Session ID generated server-side, returned to client
+  * Chat history with 20-message cap (10 turns) to control token cost
+- Responsive sidebar for chat history navigation
+- Re-upload support: delete old chunks before inserting new ones (upsert)
+
+========================================================================
+  AI & NLP CONCEPTS LEARNED
+========================================================================
+
+1. RETRIEVAL-AUGMENTED GENERATION (RAG)
+   - RAG = Retrieve relevant context first, then generate answer using it
+   - Solves LLM hallucination: model answers ONLY from provided documents
+   - Flow: User question -> Embed question -> Search vectors -> Get top
+     matching chunks -> Inject chunks into prompt as context -> LLM generates
+     answer grounded in real data
+   - Without RAG: LLM guesses or hallucinates. With RAG: LLM cites sources
+   - Trade-off: adds latency (embedding + search) but massively improves
+     accuracy for domain-specific questions
+
+2. DOCUMENT CHUNKING
+   - Documents must be split into smaller pieces before embedding
+   - Why: LLMs have token limits, and smaller chunks = more precise retrieval
+   - Chunking strategies I implemented:
+     * Section-based: split on numbered headings (e.g., "1. Annual Leave")
+       — best for structured docs like policies
+     * Paragraph-based: fallback when sections are too large
+     * Overlap (50 chars): repeat end of chunk N at start of chunk N+1
+       so boundary information is never lost during retrieval
+   - Chunk size matters: too small = loses context, too large = dilutes relevance
+   - Used 500 chars max per chunk — keeps each chunk focused on one topic
+   - Chunk ID format: "filename.txt::chunk-4" for source tracking
+
+3. EMBEDDINGS
+   - Embedding = converting text into a vector (list of numbers) that
+     represents its semantic meaning
+   - Gemini embedding-001 produces 768-dimensional vectors
+   - Similar meaning = similar vectors (close in vector space)
+   - "annual leave policy" and "vacation days rules" produce nearby vectors
+     even though they share zero words — this is the power of embeddings
+   - Batch embedding: send multiple texts in one API call for efficiency
+   - Storage: float[] in memory for math, byte[] (BLOB) in SQLite for persistence
+   - Conversion: Buffer.BlockCopy for zero-overhead float[] <-> byte[] transform
+
+4. VECTOR SIMILARITY SEARCH (Cosine Similarity)
+   - Given a query embedding, find the most similar document chunks
+   - Cosine similarity formula: dot(A,B) / (||A|| * ||B||)
+   - Returns value between -1 and 1; higher = more similar
+   - Top-K retrieval: get the 3 most relevant chunks (not all of them)
+   - Why cosine over Euclidean distance: cosine measures direction (meaning),
+     not magnitude — works better for text similarity
+   - In production: use vector databases (pgvector, Pinecone, Qdrant)
+     for indexed search. In-memory linear scan works for small datasets
+
+5. PROMPT ENGINEERING FOR RAG
+   - System prompt sets the LLM's role and behavior boundaries
+   - RAG prompt template injects retrieved context before the question:
+     "Answer based ONLY on the provided context. If not found, say so."
+   - "Do not make up information" — critical instruction to prevent
+     hallucination when context doesn't contain the answer
+   - Conversation history included in prompt for multi-turn context
+   - History capped at 20 messages to control token cost and prevent
+     old irrelevant context from confusing the model
+
+6. LLM STREAMING (Token-by-Token Generation)
+   - LLMs generate text one token at a time, not all at once
+   - Streaming sends each token as it's generated via Server-Sent Events
+   - User sees response appearing word-by-word (like ChatGPT)
+   - Without streaming: user waits 5-10 seconds staring at blank screen
+   - With streaming: first token appears in ~200ms, feels instant
+   - SSE protocol: "data: {json}\n\n" over a long-lived HTTP connection
+
+7. AI ABSTRACTION WITH SEMANTIC KERNEL
+   - Microsoft Semantic Kernel wraps different LLM providers behind
+     one interface (IChatCompletionService, ITextEmbeddingGenerationService)
+   - Swap Gemini for OpenAI or Claude by changing 2 lines of DI config
+   - SK handles: HTTP calls, auth, JSON serialization, SSE parsing,
+     role mapping (SK "Assistant" -> Gemini "model"), retries
+   - Reduced ~200 lines of raw HTTP/JSON code to 2 registration lines
+   - ChatHistory type manages conversation context with proper role handling

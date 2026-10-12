@@ -481,3 +481,9 @@ $RECYCLE.BIN/
 # Vim temporary swap files
 *.swp
 ChatBot/chatbot.db-*
+
+#Brag
+.agents/skills/brag/*
+.claude/skills/brag/*
+brag*
+skills-lock.json
