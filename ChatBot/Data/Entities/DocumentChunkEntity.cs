@@ -27,21 +27,18 @@ public class DocumentChunkEntity
 
     public int ChunkIndex { get; set; }
 
-    /// <summary>
-    /// Section heading from the document (e.g., "Director's Message").
-    /// Nullable — plain text chunks always have one, but edge cases exist.
-    /// </summary>
+    // --- Unified metadata: all use cases share same schema ---
+
     public string? SectionTitle { get; set; }
-
-    /// <summary>
-    /// Page number in the original PDF (1-based).
-    /// </summary>
     public int PageNumber { get; set; }
-
-    /// <summary>
-    /// Content type: "paragraph", "table", "figure", etc.
-    /// </summary>
     public string ChunkType { get; set; } = "paragraph";
+
+    // Hierarchical (Use Case 2)
+    public string? Chapter { get; set; }
+    public string? SubSection { get; set; }
+
+    // Visual (Use Case 3)
+    public string? Caption { get; set; }
 
     /// <summary>
     /// Embedding stored as byte[] (BLOB in SQLite).

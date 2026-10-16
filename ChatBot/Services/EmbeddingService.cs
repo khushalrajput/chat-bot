@@ -53,7 +53,8 @@ public class EmbeddingService : IEmbeddingService
     /// We chunk the embedding requests into groups of BatchSize,
     /// call the API for each batch, and concatenate results.
     /// </summary>
-    private const int BatchSize = 20; // Conservative — Gemini free tier is strict
+    private const int BatchSize = 10;  // Smaller batches = less chance of 429
+    private const int MaxRetries = 3;  // Retry up to 3 times on rate limit
 
     public async Task<List<float[]>> GetEmbeddingsAsync(
         List<string> texts,
@@ -64,7 +65,6 @@ public class EmbeddingService : IEmbeddingService
 
         var allResults = new List<float[]>();
 
-        // Process in batches to stay within API limits
         for (int i = 0; i < texts.Count; i += BatchSize)
         {
             var batch = texts.Skip(i).Take(BatchSize).ToList();
@@ -74,18 +74,34 @@ public class EmbeddingService : IEmbeddingService
             _logger.LogInformation("Embedding batch {Batch}/{Total} ({Start}-{End})",
                 batchNum, totalBatches, i + 1, Math.Min(i + BatchSize, texts.Count));
 
-            var embeddings = await _embeddingService.GenerateEmbeddingsAsync(
-                batch,
-                cancellationToken: cancellationToken);
+            // Retry with exponential backoff on 429 (Too Many Requests)
+            IList<ReadOnlyMemory<float>>? embeddings = null;
+            for (int attempt = 1; attempt <= MaxRetries; attempt++)
+            {
+                try
+                {
+                    embeddings = await _embeddingService.GenerateEmbeddingsAsync(
+                        batch, cancellationToken: cancellationToken);
+                    break; // Success — exit retry loop
+                }
+                catch (Exception ex) when (ex.Message.Contains("429") || ex.Message.Contains("Too Many Requests"))
+                {
+                    var delay = attempt * 5; // 5s, 10s, 15s
+                    _logger.LogWarning(
+                        "Rate limited on batch {Batch}. Retry {Attempt}/{Max} in {Delay}s",
+                        batchNum, attempt, MaxRetries, delay);
 
-            allResults.AddRange(embeddings.Select(e => e.ToArray()));
+                    if (attempt == MaxRetries) throw;
+                    await Task.Delay(delay * 1000, cancellationToken);
+                }
+            }
 
-            // Rate limit: Gemini free tier allows ~1500 RPM but enforces burst limits.
-            // Pause between batches to avoid connection resets.
+            allResults.AddRange(embeddings!.Select(e => e.ToArray()));
+
+            // Pause between batches — Gemini free tier is strict
             if (i + BatchSize < texts.Count)
             {
-                _logger.LogDebug("Waiting 2s before next batch (rate limit)");
-                await Task.Delay(2000, cancellationToken);
+                await Task.Delay(4000, cancellationToken); // 4s gap between batches
             }
         }
 

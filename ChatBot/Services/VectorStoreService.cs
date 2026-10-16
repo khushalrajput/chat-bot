@@ -174,6 +174,9 @@ public class VectorStoreService : IVectorStoreService
             SectionTitle = chunk.SectionTitle,
             PageNumber = chunk.PageNumber,
             ChunkType = chunk.ChunkType,
+            Chapter = chunk.Chapter,
+            SubSection = chunk.SubSection,
+            Caption = chunk.Caption,
             EmbeddingBlob = blob
         };
     }
@@ -196,6 +199,9 @@ public class VectorStoreService : IVectorStoreService
             SectionTitle = entity.SectionTitle,
             PageNumber = entity.PageNumber,
             ChunkType = entity.ChunkType,
+            Chapter = entity.Chapter,
+            SubSection = entity.SubSection,
+            Caption = entity.Caption,
             Embedding = embedding
         };
     }

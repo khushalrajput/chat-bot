@@ -158,10 +158,15 @@ public class ChatController : ControllerBase
         });
     }
 
+    private static readonly System.Text.Json.JsonSerializerOptions _jsonOptions = new()
+    {
+        PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
+    };
+
     private static async Task WriteSseEventAsync(
         HttpResponse response, object data, CancellationToken cancellationToken)
     {
-        var json = System.Text.Json.JsonSerializer.Serialize(data);
+        var json = System.Text.Json.JsonSerializer.Serialize(data, _jsonOptions);
         await response.WriteAsync($"data: {json}\n\n", cancellationToken);
         await response.Body.FlushAsync(cancellationToken);
     }
@@ -227,10 +232,10 @@ public class ChatController : ControllerBase
 
             Rules:
             1. If the answer contains a number, statistic, or dollar amount, quote it EXACTLY as it appears in the source — do not round, paraphrase, or recalculate.
-            2. Cite the section and page number where you found the answer (e.g., "According to the Library Services section, page 42...").
+            2. Do NOT include source citations, references, page numbers, or section names in your answer. Source attribution is handled separately by the system.
             3. If the context does not contain the answer, say: "This information is not available in the provided document."
             4. Do NOT infer, extrapolate, or add information beyond what is explicitly stated in the context.
-            5. If multiple sections contain relevant information, synthesize them but cite each source.
+            5. Give a clean, direct answer without any "According to..." or "Sources:" prefixes.
 
             Context from the document:
             {context}
