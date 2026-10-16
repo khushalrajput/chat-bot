@@ -4,45 +4,40 @@ using ChatBot.Models;
 namespace ChatBot.Services;
 
 /// <summary>
-/// Handles document parsing and chunking for NARRATIVE text documents.
+/// Handles document parsing and chunking for HIERARCHICAL documents.
 ///
-/// CHUNKING STRATEGY: Paragraph-aware with heading extraction.
+/// USE CASE 2: World Bank Global Economic Prospects (200 pages)
 ///
-/// Why paragraph-aware for narrative reports (like GPO Annual Report)?
-/// - Narrative text has facts embedded in prose ("GPO distributed 802,834 copies")
-/// - Splitting mid-sentence loses the fact or its context
-/// - Paragraphs are natural semantic units — each covers one topic/point
-/// - Grouping consecutive paragraphs gives enough context for accurate retrieval
+/// CHUNKING STRATEGY: Hierarchy-aware with disambiguation.
 ///
-/// Key differences from the old section-based approach:
-/// - OLD: regex for numbered headings (1. Annual Leave) — fails on real reports
-/// - NEW: detect heading-like lines (short, no trailing period, title case / ALL CAPS)
-/// - OLD: 500-char chunks — too small, splits facts from their context
-/// - NEW: ~1200-char chunks — keeps 2-3 paragraphs together
-/// - OLD: 50-char overlap — too thin to capture full sentences
-/// - NEW: 200-char overlap — captures complete boundary sentences
-/// - NEW: page number tracking from [PAGE N] markers
-/// - NEW: section title tracking for source citations
+/// The key challenge: this document talks about GDP growth, inflation, and trade
+/// for 6 different regions. "Growth is projected at 4.1 percent" means completely
+/// different things depending on whether it's in the South Asia section or
+/// Sub-Saharan Africa section. The chunker MUST tag each chunk with its full
+/// hierarchy path so retrieval can disambiguate.
+///
+/// Hierarchy: Chapter → Section → SubSection
+///   Chapter 2: Regional Outlooks
+///     Section: South Asia
+///       SubSection: Recent developments
+///       SubSection: Outlook
+///     Section: Sub-Saharan Africa
+///       SubSection: Recent developments
+///       SubSection: Outlook
+///
+/// Special content types:
+///   BOX 1.1 — self-contained articles within a chapter
+///   TABLE 2.3 — forecast tables, kept as single chunks
+///   References — skipped (citation lists, not useful for Q&A)
+///   Appendix — skipped (statistical tables, methodology)
+///   Front matter — skipped (copyright, TOC, acknowledgments)
 /// </summary>
 public partial class DocumentService : IDocumentService
 {
     private readonly ILogger<DocumentService> _logger;
 
-    // Tunable parameters — in production, move these to configuration
-    //
-    // WHY 1200 chars?
-    // Average English paragraph is ~500-800 chars. 1200 lets us keep
-    // 2 related paragraphs together. Important because narrative facts
-    // often span across paragraph boundaries:
-    //   "GPO completed the transition to govinfo. [new paragraph]
-    //    The new system replaced FDsys and was fully deployed in December 2018."
-    // At 500 chars, these end up in separate chunks. At 1200, they stay together.
-    private const int MaxChunkSize = 1200;
-
-    // WHY 200 chars overlap?
-    // Average English sentence is ~75-100 chars. 200 chars guarantees
-    // at least 2 full sentences of overlap. This means boundary sentences
-    // appear in BOTH chunks, so a question about that sentence always finds it.
+    // Larger chunks for structured docs — each section has context that helps disambiguation
+    private const int MaxChunkSize = 1500;
     private const int OverlapSize = 200;
 
     public DocumentService(ILogger<DocumentService> logger)
@@ -54,8 +49,7 @@ public partial class DocumentService : IDocumentService
     {
         var chunks = new List<DocumentChunk>();
 
-        // Step 1: Split content into page-aware blocks
-        // PdfTextExtractor inserts [PAGE N] markers — we use them to track page numbers
+        // Step 1: Split by pages (using [PAGE N] markers from PdfTextExtractor)
         var pageBlocks = SplitByPages(content);
 
         _logger.LogInformation(
@@ -63,59 +57,177 @@ public partial class DocumentService : IDocumentService
             documentName, pageBlocks.Count);
 
         var chunkIndex = 0;
-        var currentSection = "Introduction"; // Default until we find a heading
 
-        // Accumulator: we group paragraphs across pages until hitting MaxChunkSize
+        // Tracking hierarchy state as we walk through pages
+        var currentChapter = "";
+        var currentSection = "";
+        var currentSubSection = "";
+        var currentChapterNum = 0;
         var pendingText = "";
         var pendingPageNumber = 1;
+        var skipMode = false; // true when in references, appendix, or front matter
 
-        foreach (var (pageNumber, pageText) in pageBlocks)
+        foreach (var (pageNumber, pageText, chapterNum, isFrontMatter, isAppendix) in ParsePages(pageBlocks))
         {
+            // Skip front matter, appendix, and statistical sections
+            if (isFrontMatter || isAppendix)
+            {
+                skipMode = true;
+                continue;
+            }
+
+            // Update chapter tracking
+            if (chapterNum > 0 && chapterNum != currentChapterNum)
+            {
+                // Flush pending text before chapter change
+                if (!string.IsNullOrWhiteSpace(pendingText))
+                {
+                    chunks.Add(CreateChunk(documentName, pendingText.Trim(), chunkIndex++,
+                        currentChapter, currentSection, currentSubSection, pendingPageNumber));
+                    pendingText = "";
+                }
+
+                currentChapterNum = chapterNum;
+                currentChapter = DetectChapterTitle(pageText, chapterNum);
+                currentSection = "";
+                currentSubSection = "";
+                skipMode = false;
+            }
+
+            // Skip reference pages within chapters
+            if (IsReferencePage(pageText))
+            {
+                // Flush before skipping
+                if (!string.IsNullOrWhiteSpace(pendingText))
+                {
+                    chunks.Add(CreateChunk(documentName, pendingText.Trim(), chunkIndex++,
+                        currentChapter, currentSection, currentSubSection, pendingPageNumber));
+                    pendingText = "";
+                }
+                continue;
+            }
+
+            if (skipMode) continue;
+
+            // Process paragraphs on this page
             var paragraphs = pageText.Split("\n\n", StringSplitOptions.RemoveEmptyEntries);
 
             foreach (var para in paragraphs)
             {
                 var trimmed = para.Trim();
-                if (string.IsNullOrWhiteSpace(trimmed))
-                    continue;
+                if (string.IsNullOrWhiteSpace(trimmed)) continue;
 
-                // Check if this paragraph is actually a section heading
-                if (IsHeading(trimmed))
+                // Check for BOX articles: "BOX 1.1 How much will AI affect global growth?"
+                var boxMatch = BoxHeadingRegex().Match(trimmed);
+                if (boxMatch.Success)
                 {
-                    // Flush any pending text before starting new section
+                    // Flush pending before BOX
                     if (!string.IsNullOrWhiteSpace(pendingText))
                     {
-                        chunks.Add(CreateChunk(
-                            documentName, pendingText.Trim(), chunkIndex++,
-                            currentSection, pendingPageNumber));
+                        chunks.Add(CreateChunk(documentName, pendingText.Trim(), chunkIndex++,
+                            currentChapter, currentSection, currentSubSection, pendingPageNumber));
                         pendingText = "";
                     }
-
-                    currentSection = trimmed;
+                    currentSection = trimmed.Length > 80 ? trimmed[..80] : trimmed;
+                    currentSubSection = "";
                     pendingPageNumber = pageNumber;
                     continue;
                 }
 
-                // Would adding this paragraph exceed the limit?
+                // Check for TABLE headings: "TABLE 1.1 Real GDP"
+                if (TableHeadingRegex().IsMatch(trimmed))
+                {
+                    // Flush pending, then capture entire table block as one chunk
+                    if (!string.IsNullOrWhiteSpace(pendingText))
+                    {
+                        chunks.Add(CreateChunk(documentName, pendingText.Trim(), chunkIndex++,
+                            currentChapter, currentSection, currentSubSection, pendingPageNumber,
+                            "paragraph"));
+                        pendingText = "";
+                    }
+
+                    chunks.Add(CreateChunk(documentName, trimmed, chunkIndex++,
+                        currentChapter, currentSection, currentSubSection, pageNumber,
+                        "table"));
+                    continue;
+                }
+
+                // Check for region/section headings.
+                // PdfPig often concatenates headings with body text:
+                //   "South Asia Recent developments The disruptions to..."
+                // We check both standalone AND embedded-at-start patterns.
+                var detectedSection = DetectSectionHeading(trimmed);
+                if (detectedSection == null)
+                    detectedSection = DetectEmbeddedSection(trimmed);
+
+                if (detectedSection != null)
+                {
+                    // Flush pending before section change
+                    if (!string.IsNullOrWhiteSpace(pendingText))
+                    {
+                        chunks.Add(CreateChunk(documentName, pendingText.Trim(), chunkIndex++,
+                            currentChapter, currentSection, currentSubSection, pendingPageNumber));
+                        pendingText = "";
+                    }
+                    currentSection = detectedSection;
+                    currentSubSection = "";
+                    pendingPageNumber = pageNumber;
+
+                    // Strip the section name from the paragraph and continue processing remainder
+                    var remainder = trimmed[detectedSection.Length..].Trim();
+
+                    // Check if remainder starts with a sub-section heading
+                    var embeddedSub = DetectSubSectionHeading(remainder);
+                    if (embeddedSub != null)
+                    {
+                        currentSubSection = embeddedSub;
+                        remainder = remainder[embeddedSub.Length..].Trim();
+                    }
+
+                    // Keep the remaining text as pending
+                    if (!string.IsNullOrWhiteSpace(remainder))
+                        pendingText = remainder;
+
+                    continue;
+                }
+
+                // Check for sub-section headings (Recent developments, Outlook, Risks)
+                var detectedSubSection = DetectSubSectionHeading(trimmed);
+                if (detectedSubSection != null)
+                {
+                    // Flush pending before sub-section change
+                    if (!string.IsNullOrWhiteSpace(pendingText))
+                    {
+                        chunks.Add(CreateChunk(documentName, pendingText.Trim(), chunkIndex++,
+                            currentChapter, currentSection, currentSubSection, pendingPageNumber));
+                        pendingText = "";
+                    }
+                    currentSubSection = detectedSubSection;
+                    pendingPageNumber = pageNumber;
+
+                    // Handle embedded sub-section: "Recent developments Growth was broadly..."
+                    var subRemainder = trimmed[detectedSubSection.Length..].Trim();
+                    if (!string.IsNullOrWhiteSpace(subRemainder))
+                        pendingText = subRemainder;
+
+                    continue;
+                }
+
+                // Accumulate paragraph text
                 if (pendingText.Length + trimmed.Length + 2 > MaxChunkSize &&
                     !string.IsNullOrWhiteSpace(pendingText))
                 {
-                    // Flush current chunk
-                    chunks.Add(CreateChunk(
-                        documentName, pendingText.Trim(), chunkIndex++,
-                        currentSection, pendingPageNumber));
+                    chunks.Add(CreateChunk(documentName, pendingText.Trim(), chunkIndex++,
+                        currentChapter, currentSection, currentSubSection, pendingPageNumber));
 
-                    // Start new chunk with overlap from end of previous
                     pendingText = GetOverlap(pendingText) + "\n\n" + trimmed;
                     pendingPageNumber = pageNumber;
                 }
                 else
                 {
-                    // Keep accumulating
                     pendingText = string.IsNullOrEmpty(pendingText)
                         ? trimmed
                         : pendingText + "\n\n" + trimmed;
-
                     if (pendingText.Length == trimmed.Length)
                         pendingPageNumber = pageNumber;
                 }
@@ -125,26 +237,24 @@ public partial class DocumentService : IDocumentService
         // Flush final chunk
         if (!string.IsNullOrWhiteSpace(pendingText))
         {
-            chunks.Add(CreateChunk(
-                documentName, pendingText.Trim(), chunkIndex++,
-                currentSection, pendingPageNumber));
+            chunks.Add(CreateChunk(documentName, pendingText.Trim(), chunkIndex++,
+                currentChapter, currentSection, currentSubSection, pendingPageNumber));
         }
 
-        // Handle edge case: single huge paragraph that exceeds MaxChunkSize
-        // Split those by sentence boundaries
+        // Split oversized chunks by sentences
         var finalChunks = new List<DocumentChunk>();
         var finalIndex = 0;
         foreach (var chunk in chunks)
         {
-            if (chunk.Content.Length > MaxChunkSize * 1.5)
+            if (chunk.Content.Length > MaxChunkSize * 1.5 && chunk.ChunkType != "table")
             {
-                // Chunk is way too big — split by sentences
                 var sentenceChunks = SplitBySentences(chunk.Content, MaxChunkSize, OverlapSize);
                 foreach (var sc in sentenceChunks)
                 {
                     finalChunks.Add(CreateChunk(
                         documentName, sc.Trim(), finalIndex++,
-                        chunk.SectionTitle, chunk.PageNumber));
+                        chunk.Chapter, chunk.SectionTitle, chunk.SubSection,
+                        chunk.PageNumber, chunk.ChunkType));
                 }
             }
             else
@@ -157,16 +267,198 @@ public partial class DocumentService : IDocumentService
         _logger.LogInformation(
             "Document '{Document}' produced {Count} chunks (avg {Avg} chars)",
             documentName, finalChunks.Count,
-            finalChunks.Count > 0 ? finalChunks.Average(c => c.Content.Length) : 0);
+            finalChunks.Count > 0 ? (int)finalChunks.Average(c => c.Content.Length) : 0);
 
         return finalChunks;
     }
 
     /// <summary>
-    /// Split text by [PAGE N] markers inserted by PdfTextExtractor.
-    /// Returns list of (pageNumber, pageText) tuples.
-    /// If no markers found (plain text file), returns entire text as page 1.
+    /// Parse page blocks into enriched tuples with chapter/section metadata.
+    /// Uses [CHAPTER N], [FRONTMATTER], [APPENDIX] markers from PdfTextExtractor.
     /// </summary>
+    private static IEnumerable<(int PageNumber, string Text, int ChapterNum, bool IsFrontMatter, bool IsAppendix)>
+        ParsePages(List<(int PageNumber, string Text)> pages)
+    {
+        foreach (var (pageNumber, pageText) in pages)
+        {
+            var chapterNum = 0;
+            var isFrontMatter = false;
+            var isAppendix = false;
+            var cleanText = pageText;
+
+            // Parse and strip markers
+            if (cleanText.Contains("[CHAPTER "))
+            {
+                var match = Regex.Match(cleanText, @"\[CHAPTER (\d+)\]");
+                if (match.Success)
+                    chapterNum = int.Parse(match.Groups[1].Value);
+                cleanText = Regex.Replace(cleanText, @"\[CHAPTER \d+\]\n?", "");
+            }
+
+            if (cleanText.Contains("[FRONTMATTER]"))
+            {
+                isFrontMatter = true;
+                cleanText = cleanText.Replace("[FRONTMATTER]\n", "").Replace("[FRONTMATTER]", "");
+            }
+
+            if (cleanText.Contains("[APPENDIX]"))
+            {
+                isAppendix = true;
+                cleanText = cleanText.Replace("[APPENDIX]\n", "").Replace("[APPENDIX]", "");
+            }
+
+            yield return (pageNumber, cleanText.Trim(), chapterNum, isFrontMatter, isAppendix);
+        }
+    }
+
+    /// <summary>
+    /// Detect chapter title from the first content page of a chapter.
+    /// </summary>
+    private static string DetectChapterTitle(string pageText, int chapterNum)
+    {
+        var lines = pageText.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var line in lines.Take(5))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length < 5 || trimmed.Length > 120) continue;
+
+            if (trimmed.Contains("Global Outlook", StringComparison.OrdinalIgnoreCase))
+                return $"Chapter {chapterNum}: Global Outlook";
+            if (trimmed.Contains("Regional Outlook", StringComparison.OrdinalIgnoreCase))
+                return $"Chapter {chapterNum}: Regional Outlooks";
+            if (trimmed.Contains("Sovereign Debt", StringComparison.OrdinalIgnoreCase))
+                return $"Chapter {chapterNum}: Sovereign Debt";
+            if (trimmed.Contains("Fiscal Policy", StringComparison.OrdinalIgnoreCase))
+                return $"Chapter {chapterNum}: Fiscal Policy";
+            if (trimmed.Contains("Rising Challenge", StringComparison.OrdinalIgnoreCase))
+                return $"Chapter {chapterNum}: Sovereign Debt";
+            if (trimmed.Contains("Navigating Volatility", StringComparison.OrdinalIgnoreCase))
+                return $"Chapter {chapterNum}: Fiscal Policy";
+        }
+
+        return $"Chapter {chapterNum}";
+    }
+
+    /// <summary>
+    /// Detect major section headings — primarily region names in Chapter 2.
+    ///
+    /// Critical for disambiguation: "Growth is projected at 4.1 percent" in
+    /// South Asia vs Sub-Saharan Africa are completely different facts.
+    /// </summary>
+    private static string? DetectSectionHeading(string line)
+    {
+        if (line.Length > 100 || line.Length < 5) return null;
+        if (line.EndsWith('.') || line.EndsWith(',')) return null;
+
+        var knownSections = new[]
+        {
+            "East Asia and Pacific",
+            "Europe and Central Asia",
+            "Latin America and the Caribbean",
+            "Latin America and  the Caribbean",
+            "Middle East, North Africa, Afghanistan, and Pakistan",
+            "Middle East, North Africa",
+            "South Asia",
+            "Sub-Saharan Africa",
+            "Global context",
+            "Global trade",
+            "Commodity markets",
+            "Global inflation and financial developments",
+            "Major economies",
+            "Policy priorities",
+            "Summary",
+            "Executive Summary",
+        };
+
+        foreach (var section in knownSections)
+        {
+            if (line.Contains(section, StringComparison.OrdinalIgnoreCase))
+                return section;
+        }
+
+        // Fallback: ALL CAPS line with 3+ words
+        var words = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length >= 3 && line == line.ToUpperInvariant())
+            return line;
+
+        return null;
+    }
+
+    /// <summary>
+    /// Detect section names embedded at the START of a paragraph.
+    /// PdfPig often produces: "South Asia Recent developments The disruptions..."
+    /// where "South Asia" is the section heading but not on its own line.
+    /// </summary>
+    private static string? DetectEmbeddedSection(string paragraph)
+    {
+        var knownSections = new[]
+        {
+            "East Asia and Pacific",
+            "Europe and Central Asia",
+            "Latin America and the Caribbean",
+            "Latin America and  the Caribbean",
+            "Middle East, North Africa, Afghanistan, and Pakistan",
+            "Middle East, North Africa",
+            "South Asia",
+            "Sub-Saharan Africa",
+            "Executive Summary",
+        };
+
+        foreach (var section in knownSections)
+        {
+            if (paragraph.StartsWith(section, StringComparison.OrdinalIgnoreCase))
+                return section;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Detect sub-section headings within a region/section.
+    /// </summary>
+    private static string? DetectSubSectionHeading(string line)
+    {
+        var subSections = new[]
+        {
+            "Recent developments",
+            "Outlook",
+            "Risks",
+            "Downside risks",
+            "Upside risks",
+        };
+
+        foreach (var sub in subSections)
+        {
+            // Exact match (standalone heading)
+            if (line.Trim().Equals(sub, StringComparison.OrdinalIgnoreCase))
+                return sub;
+
+            // Embedded at start: "Recent developments Growth was broadly..."
+            // Only match if followed by space or end-of-string
+            if (line.TrimStart().StartsWith(sub, StringComparison.OrdinalIgnoreCase) &&
+                (line.TrimStart().Length == sub.Length ||
+                 line.TrimStart()[sub.Length] == ' ' ||
+                 line.TrimStart()[sub.Length] == '.'))
+                return sub;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Detect reference/bibliography pages to skip.
+    /// </summary>
+    private static bool IsReferencePage(string pageText)
+    {
+        if (pageText.TrimStart().StartsWith("References", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (pageText.TrimStart().StartsWith("ANNEX", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return false;
+    }
+
+    // --- Shared utilities ---
+
     private static List<(int PageNumber, string Text)> SplitByPages(string content)
     {
         var pages = new List<(int, string)>();
@@ -174,7 +466,6 @@ public partial class DocumentService : IDocumentService
 
         if (matches.Count == 0)
         {
-            // No page markers — treat entire content as page 1 (plain text file)
             pages.Add((1, content));
             return pages;
         }
@@ -193,86 +484,16 @@ public partial class DocumentService : IDocumentService
         return pages;
     }
 
-    /// <summary>
-    /// Detect whether a line is a section heading rather than body text.
-    ///
-    /// Heuristics for government/business reports:
-    /// 1. Short (under 100 chars) — headings are brief
-    /// 2. Doesn't end with a period — body sentences do
-    /// 3. Matches one of these patterns:
-    ///    - ALL CAPS: "LIBRARY SERVICES AND CONTENT MANAGEMENT"
-    ///    - Title Case: "Director's Message"
-    ///    - Starts with Roman numeral or number: "III. Financial Summary"
-    ///
-    /// WHY not just regex for specific patterns?
-    /// Government reports don't follow one format. Some use ALL CAPS headings,
-    /// some use Title Case, some use numbering. We need to catch all of them.
-    /// False positives are OK — worst case we flush a chunk early.
-    /// </summary>
-    private static bool IsHeading(string line)
-    {
-        // Too long to be a heading
-        if (line.Length > 100) return false;
-
-        // Body text ends with period, question mark, etc.
-        if (line.EndsWith('.') || line.EndsWith(',') || line.EndsWith(';'))
-            return false;
-
-        // Very short lines that are just numbers or single words — not headings
-        if (line.Length < 3) return false;
-
-        // ALL CAPS (at least 3 words to avoid false positives like "GPO" or "FY")
-        var words = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length >= 3 && line == line.ToUpperInvariant())
-            return true;
-
-        // Title Case: most words start with uppercase
-        // (at least 3 words, >60% capitalized — allows "and", "the", "of")
-        if (words.Length >= 2)
-        {
-            var capitalizedCount = words.Count(w => w.Length > 0 && char.IsUpper(w[0]));
-            if (capitalizedCount >= words.Length * 0.6)
-                return true;
-        }
-
-        // Numbered heading: "1. Something" or "III. Something"
-        if (NumberedHeadingRegex().IsMatch(line))
-            return true;
-
-        return false;
-    }
-
-    /// <summary>
-    /// Get overlap text from the end of a chunk.
-    /// Aligns to sentence boundaries so overlap always starts at a sentence.
-    ///
-    /// WHY sentence-aligned overlap?
-    /// Raw character overlap: "...nd 802,834 copies of 4,211 titles"
-    /// Sentence-aligned:      "GPO distributed 802,834 copies of 4,211 titles."
-    /// The second version is a complete, searchable thought.
-    /// </summary>
     private static string GetOverlap(string text)
     {
-        if (text.Length <= OverlapSize)
-            return text;
-
+        if (text.Length <= OverlapSize) return text;
         var overlapRegion = text[^OverlapSize..];
-
-        // Find the first sentence boundary in the overlap region
         var sentenceStart = SentenceBoundaryRegex().Match(overlapRegion);
         if (sentenceStart.Success)
-        {
             return overlapRegion[(sentenceStart.Index + sentenceStart.Length)..];
-        }
-
-        // No sentence boundary found — use the raw overlap
         return overlapRegion;
     }
 
-    /// <summary>
-    /// Split a large text block by sentence boundaries.
-    /// Used as fallback when a single paragraph exceeds MaxChunkSize.
-    /// </summary>
     private static List<string> SplitBySentences(string text, int maxSize, int overlap)
     {
         var chunks = new List<string>();
@@ -286,8 +507,6 @@ public partial class DocumentService : IDocumentService
             if (current.Length + sentence.Length > maxSize && current.Length > 0)
             {
                 chunks.Add(current.Trim());
-
-                // Overlap: keep last ~overlap chars worth of sentences
                 var overlapText = current.Length > overlap ? current[^overlap..] : current;
                 current = overlapText + " " + sentence;
             }
@@ -305,7 +524,8 @@ public partial class DocumentService : IDocumentService
 
     private static DocumentChunk CreateChunk(
         string documentName, string content, int index,
-        string? sectionTitle, int pageNumber)
+        string? chapter, string? sectionTitle, string? subSection,
+        int pageNumber, string chunkType = "paragraph")
     {
         return new DocumentChunk
         {
@@ -313,34 +533,28 @@ public partial class DocumentService : IDocumentService
             DocumentName = documentName,
             Content = content,
             ChunkIndex = index,
+            Chapter = chapter,
             SectionTitle = sectionTitle,
+            SubSection = subSection,
             PageNumber = pageNumber,
-            ChunkType = "paragraph"
+            ChunkType = chunkType
         };
     }
 
     // --- Regex patterns ---
 
-    /// <summary>Matches [PAGE 42] markers inserted by PdfTextExtractor.</summary>
     [GeneratedRegex(@"\[PAGE (\d+)\]", RegexOptions.Multiline)]
     private static partial Regex PageMarkerRegex();
 
-    /// <summary>Matches numbered headings: "1. Something" or "III. Something"</summary>
-    [GeneratedRegex(@"^(?:\d+|[IVXLC]+)\.\s+\S", RegexOptions.Multiline)]
-    private static partial Regex NumberedHeadingRegex();
+    [GeneratedRegex(@"^BOX\s+\d+\.\d+\s+\S", RegexOptions.IgnoreCase)]
+    private static partial Regex BoxHeadingRegex();
 
-    /// <summary>
-    /// Matches sentence boundaries: period/question/exclamation followed by
-    /// whitespace and an uppercase letter.
-    /// Used to find clean sentence starts in overlap regions.
-    /// </summary>
+    [GeneratedRegex(@"^TABLE\s+\d+\.\d+\s+\S", RegexOptions.IgnoreCase)]
+    private static partial Regex TableHeadingRegex();
+
     [GeneratedRegex(@"[.!?]\s+(?=[A-Z])")]
     private static partial Regex SentenceBoundaryRegex();
 
-    /// <summary>
-    /// Splits text at sentence boundaries.
-    /// Keeps the delimiter (period + space) attached to the preceding sentence.
-    /// </summary>
     [GeneratedRegex(@"(?<=[.!?])\s+(?=[A-Z])")]
     private static partial Regex SentenceSplitRegex();
 }

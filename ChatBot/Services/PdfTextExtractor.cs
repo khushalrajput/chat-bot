@@ -1,28 +1,20 @@
+using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
-using UglyToad.PdfPig.Content;
 
 namespace ChatBot.Services;
 
 /// <summary>
 /// Extracts text from PDF files page-by-page using PdfPig.
 ///
-/// WHY PdfPig?
-/// - Pure C# — no native dependencies (poppler, tesseract, etc.)
-/// - Extracts text with word positioning, so we can detect paragraphs
-/// - Lightweight: ~2MB, works on all platforms
+/// USE CASE 2 ENHANCEMENTS:
+/// - Parses chapter headers like "CHAPTER 1 GLOBAL ECONOMIC PROSPECTS | JUNE 2026 3"
+///   to extract chapter number as metadata and strip from body text
+/// - Detects front matter (pages before first chapter) and marks with [FRONTMATTER]
+/// - Detects appendix/reference sections at the end
 ///
-/// WHAT THIS DOES:
-/// - Reads each page and extracts text
-/// - Embeds [PAGE N] markers so the chunker knows page boundaries
-/// - Strips repeated headers/footers (common in government reports)
-/// - Preserves paragraph structure (double newlines between paragraphs)
-///
-/// WHAT THIS DOES NOT DO:
-/// - OCR (scanned PDFs won't work — PdfPig reads text layers only)
-/// - Table extraction (Use Case 3 will need that)
-/// - Image/chart understanding (also Use Case 3)
+/// The [PAGE N] and [CHAPTER N] markers let the chunker build hierarchy.
 /// </summary>
-public class PdfTextExtractor
+public partial class PdfTextExtractor
 {
     private readonly ILogger<PdfTextExtractor> _logger;
 
@@ -33,7 +25,7 @@ public class PdfTextExtractor
 
     /// <summary>
     /// Extract text from a PDF stream, returning page-delimited text.
-    /// Each page's text is preceded by a [PAGE N] marker.
+    /// Each page's text is preceded by [PAGE N] and optionally [CHAPTER N] markers.
     /// </summary>
     public string ExtractText(Stream pdfStream)
     {
@@ -58,32 +50,77 @@ public class PdfTextExtractor
                 linesToStrip.Count);
         }
 
-        // Second pass: clean and format each page
+        // Find where chapters start (for front matter detection)
+        int firstChapterPage = -1;
+
+        // Second pass: clean, extract chapter info, and format each page
         for (int i = 0; i < rawPages.Count; i++)
         {
-            var pageText = CleanPageText(rawPages[i], linesToStrip);
+            var rawText = rawPages[i];
+
+            // Try to extract chapter number from page header
+            // Pattern: "CHAPTER N GLOBAL ECONOMIC PROSPECTS | JUNE 2026 <pagenum>"
+            // or standalone: "CHAPTER 1GLOBAL OUTLOOK"
+            var chapterNum = ExtractChapterNumber(rawText);
+
+            var pageText = CleanPageText(rawText, linesToStrip);
 
             if (string.IsNullOrWhiteSpace(pageText))
                 continue;
 
-            pageTexts.Add($"[PAGE {i + 1}]\n{pageText}");
+            // Track first chapter page for front matter detection
+            if (chapterNum > 0 && firstChapterPage < 0)
+                firstChapterPage = i;
+
+            // Build page marker with chapter info
+            var markers = $"[PAGE {i + 1}]";
+            if (chapterNum > 0)
+                markers += $"\n[CHAPTER {chapterNum}]";
+
+            // Mark statistical appendix / selected topics
+            if (pageText.StartsWith("STATISTICAL APPENDIX", StringComparison.OrdinalIgnoreCase))
+                markers += "\n[APPENDIX]";
+            if (pageText.StartsWith("SELECTED TOPICS", StringComparison.OrdinalIgnoreCase))
+                markers += "\n[APPENDIX]";
+
+            // Mark front matter (before first chapter) — but keep Executive Summary
+            if (firstChapterPage < 0 &&
+                !pageText.Contains("Executive Summary", StringComparison.OrdinalIgnoreCase) &&
+                !pageText.Contains("Foreword", StringComparison.OrdinalIgnoreCase))
+                markers += "\n[FRONTMATTER]";
+
+            pageTexts.Add($"{markers}\n{pageText}");
         }
 
         var result = string.Join("\n\n", pageTexts);
 
         _logger.LogInformation(
-            "Extracted {CharCount} chars from {PageCount} pages",
-            result.Length, document.NumberOfPages);
+            "Extracted {CharCount} chars from {PageCount} pages (first chapter at page {FirstChapter})",
+            result.Length, document.NumberOfPages,
+            firstChapterPage >= 0 ? firstChapterPage + 1 : -1);
 
         return result;
     }
 
     /// <summary>
+    /// Extract chapter number from page header text.
+    ///
+    /// GEP format: "CHAPTER 1 GLOBAL ECONOMIC PROSPECTS | JUNE 2026 3"
+    /// Also catches: "CHAPTER 1GLOBAL OUTLOOK" (title pages with no space)
+    ///
+    /// Returns 0 if no chapter header found.
+    /// </summary>
+    private static int ExtractChapterNumber(string pageText)
+    {
+        var match = ChapterHeaderRegex().Match(pageText);
+        if (match.Success && int.TryParse(match.Groups[1].Value, out var num))
+            return num;
+        return 0;
+    }
+
+    /// <summary>
     /// Find lines that appear on more than half the pages.
     /// These are almost always headers, footers, or page numbers.
-    ///
-    /// Example: "U.S. Government Publishing Office" on every page header.
-    /// We don't want this repeated 82 times in our chunks.
     /// </summary>
     private static HashSet<string> DetectRepeatedLines(List<string> pages)
     {
@@ -92,11 +129,10 @@ public class PdfTextExtractor
 
         foreach (var page in pages)
         {
-            // Use a set so we count each line once per page, not once per occurrence
             var uniqueLines = page
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 .Select(l => l.Trim())
-                .Where(l => l.Length > 0 && l.Length < 100) // Headers/footers are short
+                .Where(l => l.Length > 0 && l.Length < 100)
                 .ToHashSet();
 
             foreach (var line in uniqueLines)
@@ -113,9 +149,10 @@ public class PdfTextExtractor
 
     /// <summary>
     /// Clean a single page's text:
+    /// - Remove chapter header lines (extracted as metadata above)
     /// - Remove repeated header/footer lines
+    /// - Strip page numbers
     /// - Collapse excessive whitespace
-    /// - Preserve paragraph boundaries (double newlines)
     /// </summary>
     private static string CleanPageText(string pageText, HashSet<string> linesToStrip)
     {
@@ -126,18 +163,32 @@ public class PdfTextExtractor
         {
             var trimmed = line.Trim();
 
-            // Skip lines identified as repeated headers/footers
             if (linesToStrip.Contains(trimmed))
                 continue;
 
-            // Skip standalone page numbers (just digits, maybe with dashes)
             if (IsPageNumber(trimmed))
+                continue;
+
+            // Strip chapter header PREFIX from body text (already extracted as [CHAPTER N])
+            // Pattern: "CHAPTER N GLOBAL ECONOMIC PROSPECTS | JUNE 2026 <pagenum>"
+            // IMPORTANT: Don't skip the whole line! PdfPig often puts entire page on one line.
+            // Strip only the header prefix and keep the rest.
+            if (ChapterPageHeaderRegex().IsMatch(trimmed))
+            {
+                // Remove header prefix up to and including the page number after "|"
+                trimmed = ChapterFullHeaderRegex().Replace(trimmed, "").Trim();
+                if (string.IsNullOrWhiteSpace(trimmed))
+                    continue;
+            }
+
+            // Strip standalone roman numeral page markers (vii, xv, xxiii, etc.)
+            // Only strip if the ENTIRE trimmed line is a roman numeral (standalone page number)
+            if (trimmed.Length <= 10 && RomanNumeralRegex().IsMatch(trimmed))
                 continue;
 
             cleanedLines.Add(trimmed);
         }
 
-        // Rejoin and normalize whitespace: collapse 3+ newlines into 2
         var result = string.Join("\n", cleanedLines);
         while (result.Contains("\n\n\n"))
             result = result.Replace("\n\n\n", "\n\n");
@@ -145,23 +196,43 @@ public class PdfTextExtractor
         return result.Trim();
     }
 
-    /// <summary>
-    /// Detect standalone page numbers: "42", "- 42 -", "Page 42", etc.
-    /// </summary>
     private static bool IsPageNumber(string line)
     {
         if (string.IsNullOrWhiteSpace(line))
             return true;
 
-        // Pure digits
         if (int.TryParse(line.Trim('-', ' '), out _))
             return true;
 
-        // "Page 42" pattern
         if (line.StartsWith("Page ", StringComparison.OrdinalIgnoreCase) &&
             int.TryParse(line[5..].Trim(), out _))
             return true;
 
         return false;
     }
+
+    // --- Regex patterns ---
+
+    /// <summary>Matches "CHAPTER 1" or "CHAPTER 4" at start of text.</summary>
+    [GeneratedRegex(@"CHAPTER\s*(\d+)", RegexOptions.IgnoreCase)]
+    private static partial Regex ChapterHeaderRegex();
+
+    /// <summary>
+    /// Detects if a line starts with a chapter page header.
+    /// "CHAPTER 1 GLOBAL ECONOMIC PROSPECTS | JUNE 2026 3"
+    /// </summary>
+    [GeneratedRegex(@"^CHAPTER\s+\d+\s+GLOBAL ECONOMIC PROSPECTS\s*\|", RegexOptions.IgnoreCase)]
+    private static partial Regex ChapterPageHeaderRegex();
+
+    /// <summary>
+    /// Captures the FULL chapter header including page number, for stripping.
+    /// "CHAPTER 1 GLOBAL ECONOMIC PROSPECTS | JUNE 2026 3" → strip all of this,
+    /// keep everything after it (the actual page content).
+    /// </summary>
+    [GeneratedRegex(@"CHAPTER\s+\d+\s+GLOBAL ECONOMIC PROSPECTS\s*\|\s*JUNE\s+\d+\s*\d*", RegexOptions.IgnoreCase)]
+    private static partial Regex ChapterFullHeaderRegex();
+
+    /// <summary>Matches standalone roman numeral lines: "vii", "xv", "xxiii"</summary>
+    [GeneratedRegex(@"^[ivxlc]+\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex RomanNumeralRegex();
 }

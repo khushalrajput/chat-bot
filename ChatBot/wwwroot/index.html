@@ -694,13 +694,16 @@
                                     // Deduplicate by section+page
                                     const seen = new Set();
                                     sources.forEach(s => {
-                                        const key = `${s.section || 'General'}::${s.page}`;
+                                        // Build hierarchy path: Chapter > Section > SubSection
+                                        const parts = [s.chapter, s.section, s.subSection].filter(Boolean);
+                                        const location = parts.length > 0 ? parts.join(' > ') : 'General';
+                                        const key = `${location}::${s.page}`;
                                         if (seen.has(key)) return;
                                         seen.add(key);
 
                                         const tag = document.createElement('span');
                                         tag.className = 'source-tag';
-                                        tag.textContent = `${s.section || 'General'} · p.${s.page}`;
+                                        tag.textContent = `${location} · p.${s.page}`;
                                         srcEl.appendChild(tag);
                                     });
 

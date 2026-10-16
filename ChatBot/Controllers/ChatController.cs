@@ -53,7 +53,9 @@ public class ChatController : ControllerBase
             sources = relevantChunks.Select(c => new SourceInfo
             {
                 Document = c.DocumentName,
+                Chapter = c.Chapter,
                 Section = c.SectionTitle,
+                SubSection = c.SubSection,
                 Page = c.PageNumber
             }).ToList();
 
@@ -122,7 +124,9 @@ public class ChatController : ControllerBase
             sources = relevantChunks.Select(c => new SourceInfo
             {
                 Document = c.DocumentName,
+                Chapter = c.Chapter,
                 Section = c.SectionTitle,
+                SubSection = c.SubSection,
                 Page = c.PageNumber
             }).ToList();
 
@@ -208,7 +212,18 @@ public class ChatController : ControllerBase
     private static string FormatChunksAsContext(List<DocumentChunk> chunks)
     {
         return string.Join("\n\n---\n\n", chunks.Select(c =>
-            $"[Source: {c.DocumentName} | Section: {c.SectionTitle ?? "Unknown"} | Page: {c.PageNumber}]\n{c.Content}"));
+        {
+            // Build hierarchical source path: Chapter > Section > SubSection
+            var parts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(c.Chapter)) parts.Add(c.Chapter);
+            if (!string.IsNullOrWhiteSpace(c.SectionTitle)) parts.Add(c.SectionTitle);
+            if (!string.IsNullOrWhiteSpace(c.SubSection)) parts.Add(c.SubSection);
+            var location = parts.Count > 0 ? string.Join(" > ", parts) : "Unknown";
+
+            var typeTag = c.ChunkType != "paragraph" ? $" | Type: {c.ChunkType}" : "";
+
+            return $"[Source: {c.DocumentName} | {location} | Page: {c.PageNumber}{typeTag}]\n{c.Content}";
+        }));
     }
 
     /// <summary>
@@ -228,21 +243,22 @@ public class ChatController : ControllerBase
     private static string BuildRagPrompt(string question, string context)
     {
         return $"""
-            You are a document Q&A assistant. Answer ONLY using the provided context.
+            You are a document Q&A assistant for a structured economic report. Answer ONLY using the provided context.
 
             Rules:
-            1. If the answer contains a number, statistic, or dollar amount, quote it EXACTLY as it appears in the source — do not round, paraphrase, or recalculate.
+            1. If the answer contains a number, statistic, or percentage, quote it EXACTLY as it appears in the source — do not round, paraphrase, or recalculate.
             2. Do NOT include source citations, references, page numbers, or section names in your answer. Source attribution is handled separately by the system.
             3. If the context does not contain the answer, say: "This information is not available in the provided document."
             4. Do NOT infer, extrapolate, or add information beyond what is explicitly stated in the context.
             5. Give a clean, direct answer without any "According to..." or "Sources:" prefixes.
+            6. CRITICAL: The document contains data for multiple regions and chapters. Pay close attention to the [Source: ...] headers above each context block. Do NOT mix facts from one region with another or from one chapter with another. If the question asks about a specific region, use ONLY context from that region's section.
 
             Context from the document:
             {context}
 
             Question: {question}
 
-            Provide a clear, accurate answer with source citations.
+            Provide a clear, accurate answer.
             """;
     }
 }
@@ -258,7 +274,9 @@ public record ChatRequest(string Message, string? SessionId = null);
 public record SourceInfo
 {
     public required string Document { get; init; }
+    public string? Chapter { get; init; }
     public string? Section { get; init; }
+    public string? SubSection { get; init; }
     public int Page { get; init; }
 }
 
