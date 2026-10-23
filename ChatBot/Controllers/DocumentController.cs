@@ -11,27 +11,40 @@ public class DocumentController : ControllerBase
     private readonly IEmbeddingService _embeddingService;
     private readonly IVectorStoreService _vectorStoreService;
     private readonly PdfTextExtractor _pdfTextExtractor;
+    private readonly GeminiPdfExtractor _geminiPdfExtractor;
+    private readonly PerDocumentService _perDocumentService;
 
     public DocumentController(
         IDocumentService documentService,
         IEmbeddingService embeddingService,
         IVectorStoreService vectorStoreService,
-        PdfTextExtractor pdfTextExtractor)
+        PdfTextExtractor pdfTextExtractor,
+        GeminiPdfExtractor geminiPdfExtractor,
+        PerDocumentService perDocumentService)
     {
         _documentService = documentService;
         _embeddingService = embeddingService;
         _vectorStoreService = vectorStoreService;
         _pdfTextExtractor = pdfTextExtractor;
+        _geminiPdfExtractor = geminiPdfExtractor;
+        _perDocumentService = perDocumentService;
     }
 
     /// <summary>
     /// Ingest a document (PDF or TXT) into the RAG pipeline.
     /// Full pipeline: Upload → Extract Text → Chunk → Embed → Store
     ///
-    /// WHAT CHANGED FROM BEFORE:
-    /// - Now accepts .pdf files (via PdfTextExtractor) in addition to .txt
-    /// - PDF extraction preserves page numbers and paragraph structure
-    /// - Chunks now carry metadata (section, page, type) for source citations
+    /// EXTRACTION STRATEGIES (controlled by ?vision= query param):
+    ///
+    ///   vision=false (default): PdfPig text-only → DocumentService (chapter-based)
+    ///     Use for: text-heavy PDFs (GPO Annual Report, World Bank GEP)
+    ///     Pro: fast, offline, zero extra tokens
+    ///     Con: loses charts, callout boxes, diagrams
+    ///
+    ///   vision=true: Gemini Files API → PerDocumentService (lifecycle-stage-based)
+    ///     Use for: vision-heavy PDFs (iMac PER, product reports, infographic-heavy docs)
+    ///     Pro: captures visual data — charts, stat boxes, material cards
+    ///     Con: extra API call + tokens for extraction step
     ///
     /// PRODUCTION CONSIDERATION:
     /// In real apps, ingestion is async (queue-based).
@@ -41,7 +54,8 @@ public class DocumentController : ControllerBase
     [HttpPost("upload")]
     public async Task<IActionResult> UploadDocument(
         IFormFile file,
-        CancellationToken cancellationToken)
+        [FromQuery] bool vision = false,
+        CancellationToken cancellationToken = default)
     {
         if (file is null || file.Length == 0)
             return BadRequest(new { error = "File is required" });
@@ -50,24 +64,40 @@ public class DocumentController : ControllerBase
         if (extension is not ".txt" and not ".pdf")
             return BadRequest(new { error = "Only .txt and .pdf files are supported" });
 
-        // Step 1: Extract text based on file type
+        // Step 1: Extract text based on file type and chosen strategy
         string content;
+        var extractionMethod = "text";
 
-        if (extension == ".pdf")
+        if (extension == ".pdf" && vision)
         {
-            // PDF: extract text with page markers using PdfPig
+            // Vision strategy: Gemini Files API — captures text AND visual content
+            // (charts, stat callouts, material cards, lifecycle diagrams)
+            using var stream = file.OpenReadStream();
+            content = await _geminiPdfExtractor.ExtractTextAsync(
+                stream, file.FileName, cancellationToken);
+            extractionMethod = "gemini-vision";
+        }
+        else if (extension == ".pdf")
+        {
+            // Text strategy: PdfPig — fast, offline, text glyphs only
             using var stream = file.OpenReadStream();
             content = _pdfTextExtractor.ExtractText(stream);
+            extractionMethod = "pdfpig";
         }
         else
         {
             // TXT: read directly
             using var reader = new StreamReader(file.OpenReadStream());
             content = await reader.ReadToEndAsync(cancellationToken);
+            extractionMethod = "plaintext";
         }
 
-        // Step 2: Chunk the document (narrative-aware chunking with metadata)
-        var chunks = _documentService.ChunkDocument(file.FileName, content);
+        // Step 2: Chunk using the appropriate strategy
+        //   vision=true  → PerDocumentService: section-based (lifecycle stages)
+        //   vision=false → DocumentService: chapter-based (region hierarchy)
+        var chunks = vision
+            ? _perDocumentService.ChunkDocument(file.FileName, content)
+            : _documentService.ChunkDocument(file.FileName, content);
 
         // Step 3: Generate embeddings for all chunks (batch API call)
         var texts = chunks.Select(c => c.Content).ToList();
@@ -86,6 +116,7 @@ public class DocumentController : ControllerBase
         {
             document = file.FileName,
             fileType = extension,
+            extractionMethod,
             chunksCreated = chunks.Count,
             embeddingDimension = embeddings[0].Length,
             averageChunkSize = (int)chunks.Average(c => c.Content.Length),

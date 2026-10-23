@@ -251,7 +251,7 @@ public class ChatController : ControllerBase
             3. If the context does not contain the answer, say: "This information is not available in the provided document."
             4. Do NOT infer, extrapolate, or add information beyond what is explicitly stated in the context.
             5. Give a clean, direct answer without any "According to..." or "Sources:" prefixes.
-            6. CRITICAL: The document contains data for multiple regions and chapters. Pay close attention to the [Source: ...] headers above each context block. Do NOT mix facts from one region with another or from one chapter with another. If the question asks about a specific region, use ONLY context from that region's section.
+            6. CRITICAL: Pay close attention to the [Source: ...] headers above each context block. Documents may be organized by region, chapter, or lifecycle stage. Do NOT mix facts from different sections. If the question asks about a specific region, chapter, or product lifecycle stage, use ONLY context from that section's blocks.
 
             Context from the document:
             {context}

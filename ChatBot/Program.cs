@@ -44,7 +44,9 @@ builder.Services.AddGoogleAIEmbeddingGeneration(
 builder.Services.AddScoped<IChatService, ChatService>();
 builder.Services.AddScoped<IEmbeddingService, EmbeddingService>();
 builder.Services.AddScoped<IDocumentService, DocumentService>();
-builder.Services.AddScoped<PdfTextExtractor>();  // PDF text extraction via PdfPig
+builder.Services.AddScoped<PdfTextExtractor>();   // Use Case 1 & 2: PdfPig text-only extraction
+builder.Services.AddHttpClient<GeminiPdfExtractor>(); // Use Case 3: Gemini Files API vision extraction
+builder.Services.AddScoped<PerDocumentService>();  // Use Case 3: lifecycle-stage chunker
 builder.Services.AddSingleton<IVectorStoreService, VectorStoreService>();
 builder.Services.AddSingleton<IChatHistoryService, ChatHistoryService>();
 

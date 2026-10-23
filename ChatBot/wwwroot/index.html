@@ -146,7 +146,7 @@
             transition: max-height 0.3s ease, padding 0.3s ease;
         }
         .upload-panel.open {
-            max-height: 200px;
+            max-height: 260px;
             padding: 16px 20px;
         }
         .upload-area {
@@ -383,6 +383,13 @@
                 <div class="icon">&#128196;</div>
                 <p>Drop a .txt or .pdf file here or click to upload</p>
             </div>
+            <div style="margin-top:10px;display:flex;align-items:center;gap:8px;">
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;color:#444;user-select:none;">
+                    <input type="checkbox" id="visionMode" style="width:15px;height:15px;cursor:pointer;">
+                    <span>Vision mode</span>
+                </label>
+                <span style="font-size:12px;color:#888;">(Use for PDFs with charts/images — extracts visual content via Gemini)</span>
+            </div>
             <div class="upload-status" id="uploadStatus"></div>
         </div>
 
@@ -421,6 +428,7 @@
         const uploadPanel = document.getElementById('uploadPanel');
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
+        const visionMode = document.getElementById('visionMode');
         const uploadStatus = document.getElementById('uploadStatus');
         const docStatus = document.getElementById('docStatus');
         const typingIndicator = document.getElementById('typingIndicator');
@@ -595,11 +603,17 @@
             uploadStatus.textContent = 'Uploading and processing...';
             uploadStatus.className = 'upload-status';
 
+            const useVision = visionMode.checked;
             const formData = new FormData();
             formData.append('file', file);
 
+            if (useVision) {
+                uploadStatus.textContent = 'Uploading to Gemini (vision extraction — may take ~30s)...';
+            }
+
             try {
-                const res = await fetch(`${API_BASE}/api/document/upload`, {
+                const url = `${API_BASE}/api/document/upload${useVision ? '?vision=true' : ''}`;
+                const res = await fetch(url, {
                     method: 'POST',
                     body: formData
                 });
@@ -610,7 +624,8 @@
                 }
 
                 const data = await res.json();
-                uploadStatus.textContent = `"${data.document}" uploaded — ${data.chunksCreated} chunks (avg ${data.averageChunkSize} chars, ${data.totalChunksInStore} total)`;
+                const method = data.extractionMethod ? ` [${data.extractionMethod}]` : '';
+                uploadStatus.textContent = `"${data.document}" uploaded${method} — ${data.chunksCreated} chunks (avg ${data.averageChunkSize} chars, ${data.totalChunksInStore} total)`;
                 uploadStatus.className = 'upload-status success';
                 docStatus.textContent = `${data.totalChunksInStore} chunks`;
                 fileInput.value = '';
